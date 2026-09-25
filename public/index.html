@@ -1,0 +1,178 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta name="theme-color" content="#08111f" />
+    <title>AgentSwarm</title>
+    <link rel="stylesheet" href="/styles.css" />
+  </head>
+  <body>
+    <div class="app-shell">
+      <aside class="sidebar">
+        <div class="brand">
+          <div class="brand-mark">*</div>
+          <div>
+            <strong>AgentSwarm</strong>
+            <span>multi-agent control room</span>
+          </div>
+        </div>
+        <div class="sidebar-section">
+          <div class="section-label">Workspace</div>
+          <div id="project-list" class="project-list"></div>
+          <button id="new-project-button" class="button button-primary button-wide">+ Connect repository</button>
+        </div>
+        <div class="sidebar-footer">
+          <div class="live-dot"><span></span> Local control plane</div>
+          <div class="version">MVP · git-isolated workers</div>
+        </div>
+      </aside>
+
+      <main class="main-content">
+        <header class="topbar">
+          <div>
+            <div class="eyebrow">Repository operations</div>
+            <h1 id="page-title">Connect a repository</h1>
+          </div>
+          <div class="topbar-actions">
+            <span id="connection-state" class="status-pill status-muted">Offline</span>
+            <button id="refresh-button" class="button button-ghost" disabled>Refresh</button>
+          </div>
+        </header>
+
+        <section id="welcome-view" class="welcome-view">
+          <div class="welcome-copy">
+            <div class="hero-kicker">One repo. Many minds.</div>
+            <h2>Coordinate coding agents without sharing a checkout.</h2>
+            <p>AgentSwarm gives every worker an isolated Git workspace, a dependency-aware task graph, and a review queue before anything reaches your branch.</p>
+            <button id="welcome-connect-button" class="button button-primary button-large">Connect your first repository</button>
+          </div>
+          <div class="hero-orbit" aria-hidden="true">
+            <div class="orbit orbit-one"></div>
+            <div class="orbit orbit-two"></div>
+            <div class="orbit-core">AS</div>
+            <div class="orbit-node node-one">Codex</div>
+            <div class="orbit-node node-two">Claude</div>
+            <div class="orbit-node node-three">OpenCode</div>
+          </div>
+        </section>
+
+        <section id="dashboard-view" class="dashboard-view hidden">
+          <div class="project-banner panel">
+            <div class="project-banner-main">
+              <div class="repo-icon">R</div>
+              <div>
+                <div class="section-label">Active repository</div>
+                <h2 id="active-project-name">—</h2>
+                <div id="active-project-meta" class="muted-text">—</div>
+              </div>
+            </div>
+            <div class="project-banner-actions">
+              <button id="sync-button" class="button button-ghost">Sync source</button>
+              <button id="dispatch-all-button" class="button button-secondary">Run ready tasks</button>
+              <button id="project-plan-button" class="button button-ghost">Delegate a plan</button>
+            </div>
+          </div>
+
+          <div id="stats-row" class="stats-row"></div>
+
+          <div class="dashboard-grid">
+            <section class="panel composer-panel">
+              <div class="panel-heading">
+                <div>
+                  <div class="section-label">Delegate work</div>
+                  <h3>New task</h3>
+                </div>
+                <span class="panel-icon">+</span>
+              </div>
+              <form id="task-form" class="stack-form">
+                <label>Task title<input id="task-title" required placeholder="e.g. Add retry policy to API client" /></label>
+                <label>Instructions<textarea id="task-description" required rows="4" placeholder="Describe the outcome, constraints, and files the agent should inspect."></textarea></label>
+                <div class="form-row">
+                  <label>Agent<select id="task-provider"></select></label>
+                  <label>Model<input id="task-model" placeholder="optional" /></label>
+                </div>
+                <label>Dependencies<input id="task-dependencies" placeholder="task IDs, comma separated" /></label>
+                <label>Allowed paths<input id="task-paths" placeholder="src/, tests/ (optional)" /></label>
+                <label>Acceptance checks<input id="task-tests" placeholder="npm test, lint passes (optional)" /></label>
+                <label>Verification command<input id="task-verify" placeholder="npm test (optional)" /></label>
+                <button class="button button-primary button-wide" type="submit">Queue task</button>
+              </form>
+            </section>
+
+            <section class="panel activity-panel">
+              <div class="panel-heading">
+                <div>
+                  <div class="section-label">Live feed</div>
+                  <h3>Activity</h3>
+                </div>
+                <span id="activity-count" class="count-badge">0</span>
+              </div>
+              <div id="activity-list" class="activity-list"></div>
+            </section>
+          </div>
+
+          <section class="panel board-panel">
+            <div class="panel-heading board-heading">
+              <div>
+                <div class="section-label">Task graph</div>
+                <h3>Work in motion</h3>
+              </div>
+              <div class="legend"><span class="legend-item"><i class="dot dot-running"></i>running</span><span class="legend-item"><i class="dot dot-review"></i>review</span><span class="legend-item"><i class="dot dot-done"></i>done</span></div>
+            </div>
+            <div id="task-board" class="task-board"></div>
+          </section>
+
+          <section class="panel changes-panel">
+            <div class="panel-heading">
+              <div>
+                <div class="section-label">Integration queue</div>
+                <h3>Changes to merge</h3>
+              </div>
+              <span id="change-count" class="count-badge">0</span>
+            </div>
+            <div id="change-list" class="change-list"></div>
+          </section>
+        </section>
+      </main>
+    </div>
+
+    <dialog id="project-dialog" class="modal">
+      <form id="project-form" method="dialog" class="modal-card">
+        <button type="button" class="modal-close" data-close="project-dialog">x</button>
+        <div class="section-label">New workspace</div>
+        <h3>Connect a repository</h3>
+        <p class="muted-text">AgentSwarm creates a managed mirror, so agents never edit your working tree directly.</p>
+        <label>Project name<input id="project-name" required placeholder="Payments service" /></label>
+        <label>Local repository path<input id="project-path" required placeholder="/home/you/projects/payments" /></label>
+        <label>Default branch<input id="project-branch" placeholder="main" /></label>
+        <div id="project-error" class="form-error"></div>
+        <div class="modal-actions"><button type="button" class="button button-ghost" data-close="project-dialog">Cancel</button><button class="button button-primary" type="submit">Create workspace</button></div>
+      </form>
+    </dialog>
+
+    <dialog id="plan-dialog" class="modal">
+      <form id="plan-form" method="dialog" class="modal-card">
+        <button type="button" class="modal-close" data-close="plan-dialog">x</button>
+        <div class="section-label">Main agent</div>
+        <h3>Delegate a plan</h3>
+        <p class="muted-text">The starter plan creates an inspect -> implement -> verify sequence. You can edit or replace the tasks afterward.</p>
+        <label>Goal<textarea id="plan-goal" required rows="4" placeholder="Add usage metrics to the billing API and expose them in the admin dashboard."></textarea></label>
+        <div id="plan-error" class="form-error"></div>
+        <div class="modal-actions"><button type="button" class="button button-ghost" data-close="plan-dialog">Cancel</button><button class="button button-primary" type="submit">Create delegated plan</button></div>
+      </form>
+    </dialog>
+
+    <dialog id="diff-dialog" class="modal modal-wide">
+      <div class="modal-card">
+        <button type="button" class="modal-close" data-close="diff-dialog">x</button>
+        <div class="section-label">Change review</div>
+        <h3 id="diff-title">Diff</h3>
+        <pre id="diff-content" class="diff-view"></pre>
+      </div>
+    </dialog>
+
+    <div id="toast" class="toast" role="status"></div>
+    <script type="module" src="/app.js"></script>
+  </body>
+</html>
