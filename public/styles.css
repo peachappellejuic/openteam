@@ -45,7 +45,8 @@ button:disabled { cursor: not-allowed; opacity: 0.45; }
 .project-item-copy { min-width: 0; }
 .project-item-name { display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 12px; font-weight: 700; }
 .project-item-meta { display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--faint); font-size: 10px; margin-top: 2px; }
-.sidebar-footer { padding: 18px 9px 0; border-top: 1px solid var(--line); color: var(--faint); font-size: 10px; }
+.sidebar-footer { display: grid; gap: 8px; padding: 18px 9px 0; border-top: 1px solid var(--line); color: var(--faint); font-size: 10px; }
+.identity-field { color: var(--faint); }
 .live-dot { display: flex; align-items: center; gap: 7px; color: var(--muted); }
 .live-dot span { width: 7px; height: 7px; border-radius: 50%; background: var(--green); box-shadow: 0 0 0 4px rgba(126,226,166,0.1); }
 .version { margin-top: 9px; }
@@ -59,6 +60,8 @@ h2 { font-size: 19px; letter-spacing: -0.03em; }
 h3 { margin-top: 5px; font-size: 16px; letter-spacing: -0.02em; }
 .muted-text { color: var(--muted); font-size: 12px; line-height: 1.55; }
 .topbar-actions { display: flex; align-items: center; gap: 9px; }
+.token-field { width: 150px; }
+.token-field input { height: 30px; font-size: 11px; }
 
 .button { display: inline-flex; align-items: center; justify-content: center; gap: 7px; min-height: 36px; padding: 0 14px; border: 1px solid transparent; border-radius: 9px; color: var(--text); font-size: 12px; font-weight: 750; transition: 160ms ease; }
 .button:hover:not(:disabled) { transform: translateY(-1px); filter: brightness(1.08); }
@@ -143,6 +146,11 @@ select { appearance: none; background-image: linear-gradient(45deg, transparent 
 .task-card-description { display: -webkit-box; overflow: hidden; color: var(--muted); font-size: 10px; line-height: 1.4; -webkit-box-orient: vertical; -webkit-line-clamp: 2; }
 .task-card-footer { display: flex; align-items: center; justify-content: space-between; gap: 6px; color: var(--faint); font-size: 9px; }
 .task-card-actions { display: flex; gap: 5px; }
+.assignee-badge { max-width: 96px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; padding: 0 7px; min-height: 25px; border: 1px solid rgba(93,225,208,0.34); border-radius: 6px; color: var(--cyan); background: rgba(93,225,208,0.07); font-size: 9px; font-weight: 800; }
+.assignee-unset { border-style: dashed; border-color: var(--line-strong); color: var(--faint); background: transparent; }
+.board-filters { display: flex; align-items: center; gap: 12px; padding: 0 21px 14px; }
+.filter-field { width: 165px; }
+.filter-field input { height: 30px; font-size: 11px; }
 .mini-button { min-height: 25px; padding: 0 8px; border: 1px solid var(--line-strong); border-radius: 6px; color: var(--muted); background: transparent; font-size: 9px; font-weight: 800; }
 .mini-button:hover { color: var(--text); background: rgba(255,255,255,0.06); }
 .mini-button-primary { color: var(--cyan); border-color: rgba(93,225,208,0.3); }
@@ -185,7 +193,7 @@ select { appearance: none; background-image: linear-gradient(45deg, transparent 
   .sidebar { width: 100%; height: auto; padding: 15px; border-right: 0; border-bottom: 1px solid var(--line); }
   .brand { padding-bottom: 13px; }
   .sidebar-section { display: flex; align-items: center; gap: 9px; }
-  .sidebar-section .section-label, .sidebar-footer { display: none; }
+  .sidebar-section .section-label, .sidebar-footer .live-dot, .sidebar-footer .version { display: none; }
   .project-list { display: flex; flex: 1; overflow-x: auto; margin: 0; }
   .project-item { min-width: 140px; }
   .sidebar-section .button { width: auto; min-width: 42px; padding: 0 10px; font-size: 0; }

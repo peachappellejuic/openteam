@@ -9,10 +9,17 @@ try {
 } catch {}
 
 const port = Number.parseInt(process.env.PORT ?? "4317", 10);
+const host = process.env.HOST ?? "127.0.0.1";
+const sharedToken = (process.env.AGENTSWARM_SHARED_TOKEN ?? "").trim();
+
+export const isLoopbackHost = (value: string): boolean => value === "127.0.0.1" || value === "localhost" || value === "::1";
 
 export const config = {
   port: Number.isFinite(port) ? port : 4317,
-  host: process.env.HOST ?? "127.0.0.1",
+  host,
+  sharedToken,
+  sharedTokenRequired: sharedToken.length > 0,
+  sharedTokenMissing: !isLoopbackHost(host) && sharedToken.length === 0,
   dataDir: resolve(process.env.AGENTSWARM_DATA_DIR ?? join(projectRoot, "data")),
   publicDir: resolve(join(projectRoot, "public")),
   maxBodyBytes: 2 * 1024 * 1024,

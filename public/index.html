@@ -23,6 +23,8 @@
           <button id="new-project-button" class="button button-primary button-wide">+ Connect repository</button>
         </div>
         <div class="sidebar-footer">
+          <label class="identity-field">You are<input id="identity-input" placeholder="your name" autocomplete="off" /></label>
+          <button id="my-tasks-button" class="button button-ghost button-wide">Show my tasks</button>
           <div class="live-dot"><span></span> Local control plane</div>
           <div class="version">MVP · git-isolated workers</div>
         </div>
@@ -35,6 +37,7 @@
             <h1 id="page-title">Connect a repository</h1>
           </div>
           <div class="topbar-actions">
+            <label class="token-field">Shared token<input id="shared-token" type="password" placeholder="not required" autocomplete="off" /></label>
             <span id="connection-state" class="status-pill status-muted">Offline</span>
             <button id="refresh-button" class="button button-ghost" disabled>Refresh</button>
           </div>
@@ -92,6 +95,8 @@
                   <label>Agent<select id="task-provider"></select></label>
                   <label>Model<input id="task-model" placeholder="optional" /></label>
                 </div>
+                <label>Assignee<input id="task-assignee" placeholder="optional" list="assignee-options" /></label>
+                <datalist id="assignee-options"></datalist>
                 <label>Dependencies<input id="task-dependencies" placeholder="task IDs, comma separated" /></label>
                 <label>Allowed paths<input id="task-paths" placeholder="src/, tests/ (optional)" /></label>
                 <label>Acceptance checks<input id="task-tests" placeholder="npm test, lint passes (optional)" /></label>
@@ -119,6 +124,10 @@
                 <h3>Work in motion</h3>
               </div>
               <div class="legend"><span class="legend-item"><i class="dot dot-running"></i>running</span><span class="legend-item"><i class="dot dot-review"></i>review</span><span class="legend-item"><i class="dot dot-done"></i>done</span></div>
+            </div>
+            <div class="board-filters">
+              <label class="filter-field">Filter by assignee<input id="task-filter" placeholder="everyone" autocomplete="off" /></label>
+              <span id="task-filter-note" class="muted-text"></span>
             </div>
             <div id="task-board" class="task-board"></div>
           </section>

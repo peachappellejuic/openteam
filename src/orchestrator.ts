@@ -46,6 +46,7 @@ const pathAllowed = (file: string, patterns: string[]): boolean => patterns.some
 export class Orchestrator {
   private readonly activeRuns = new Map<string, AbortController>();
   private readonly startingTasks = new Set<string>();
+  private readonly pendingStarts = new Set<Promise<void>>();
   private readonly syncOperations = new Map<string, Promise<SyncResult>>();
 
   public constructor(private readonly store: JsonStore) {}
@@ -127,6 +128,7 @@ export class Orchestrator {
       title,
       description,
       status: "queued",
+      assignee: input.assignee?.trim() || undefined,
       provider: provider as ProviderId,
       model: input.model?.trim() || undefined,
       dependencies,
@@ -139,7 +141,7 @@ export class Orchestrator {
     };
     await this.store.createTask(task);
     await this.event({ projectId, taskId: id, type: "task.created", message: `Task queued: ${title}` });
-    void this.dispatchReadyTasks(projectId);
+    this.dispatchInBackground(projectId);
     return task;
   }
 
@@ -183,8 +185,22 @@ export class Orchestrator {
       created.push(task);
     }
     await this.event({ projectId, type: "plan.created", message: `Plan created for ${project.name}: ${goal}` });
-    void this.dispatchReadyTasks(projectId);
+    this.dispatchInBackground(projectId);
     return created;
+  }
+
+  public async assignTask(taskId: string, assignee?: string): Promise<Task> {
+    const task = this.store.getTask(taskId);
+    if (!task) throw new Error("Task not found");
+    const name = assignee?.trim() || undefined;
+    const updated = await this.store.updateTask(taskId, { assignee: name });
+    await this.event({
+      projectId: task.projectId,
+      taskId,
+      type: "task.assigned",
+      message: name ? `Task assigned to ${name}: ${task.title}` : `Task unassigned: ${task.title}`,
+    });
+    return updated ?? task;
   }
 
   public async dispatchTask(taskId: string): Promise<Task> {
@@ -192,9 +208,7 @@ export class Orchestrator {
     if (!task) throw new Error("Task not found");
     if (["running", "completed", "cancelled"].includes(task.status)) return task;
     this.assertDependencies(task);
-    this.startTask(task).catch((error: unknown) => {
-      void this.failTask(task, error);
-    });
+    this.trackStart(this.startTask(task));
     return this.store.getTask(taskId) ?? task;
   }
 
@@ -204,9 +218,7 @@ export class Orchestrator {
       if (task.status !== "queued" && task.status !== "blocked") continue;
       if (!this.dependenciesComplete(task)) continue;
       if (this.startingTasks.has(task.id)) continue;
-      this.startTask(task).catch((error: unknown) => {
-        void this.failTask(task, error);
-      });
+      this.trackStart(this.startTask(task));
     }
   }
 
@@ -255,7 +267,7 @@ export class Orchestrator {
       await this.store.updateTask(change.taskId, { status: "completed", completedAt: now(), result: `Merged as ${result.mergeSha}` });
       if (this.store.getTask(change.taskId)?.workspacePath) await removeWorkspace(this.store.getTask(change.taskId)!.workspacePath!);
       await this.event({ projectId: project.id, taskId: change.taskId, changeId, type: "change.merged", message: `Change merged as ${result.mergeSha}` });
-      void this.dispatchReadyTasks(project.id);
+      this.dispatchInBackground(project.id);
       return updated ?? change;
     } catch (error) {
       const message = error instanceof Error ? error.message : "Merge failed";
@@ -280,8 +292,25 @@ export class Orchestrator {
     return listProviders();
   }
 
+  public async drain(): Promise<void> {
+    while (this.pendingStarts.size) {
+      await Promise.all([...this.pendingStarts]);
+    }
+  }
+
   public async shutdown(): Promise<void> {
     for (const controller of this.activeRuns.values()) controller.abort();
+    await this.drain();
+  }
+
+  private dispatchInBackground(projectId: string): void {
+    void this.dispatchReadyTasks(projectId).catch(() => undefined);
+  }
+
+  private trackStart(promise: Promise<void>): void {
+    const tracked = promise.catch(() => undefined);
+    this.pendingStarts.add(tracked);
+    void tracked.finally(() => this.pendingStarts.delete(tracked));
   }
 
   private requireProject(projectId: string): Project {
@@ -425,7 +454,7 @@ export class Orchestrator {
     } finally {
       if (runId) this.activeRuns.delete(runId);
       this.startingTasks.delete(task.id);
-      if (project) void this.dispatchReadyTasks(project.id);
+      if (project) this.dispatchInBackground(project.id);
     }
   }
 

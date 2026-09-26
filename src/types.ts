@@ -29,6 +29,7 @@ export interface Task {
   title: string;
   description: string;
   status: TaskStatus;
+  assignee?: string;
   provider: ProviderId;
   model?: string;
   branch?: string;
@@ -104,6 +105,7 @@ export interface CreateProjectInput {
 export interface CreateTaskInput {
   title: string;
   description: string;
+  assignee?: string;
   provider?: ProviderId;
   model?: string;
   dependencies?: string[];
@@ -115,7 +117,7 @@ export interface CreateTaskInput {
 
 export interface PlanInput {
   goal: string;
-  tasks?: Array<Pick<CreateTaskInput, "title" | "description" | "provider" | "dependencies" | "allowedPaths" | "acceptanceTests" | "verifyCommand">>;
+  tasks?: Array<Pick<CreateTaskInput, "title" | "description" | "assignee" | "provider" | "dependencies" | "allowedPaths" | "acceptanceTests" | "verifyCommand">>;
 }
 
 export interface ProjectSnapshot {

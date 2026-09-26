@@ -1,5 +1,6 @@
 import { createReadStream } from "node:fs";
 import { readFile, stat } from "node:fs/promises";
+import { timingSafeEqual } from "node:crypto";
 import { createServer as createHttpServer, type IncomingMessage, type ServerResponse } from "node:http";
 import { extname, join, relative, resolve, sep } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -55,6 +56,31 @@ const stringArray = (body: Record<string, unknown>, key: string): string[] => {
   if (value === undefined) return [];
   if (!Array.isArray(value) || value.some((item) => typeof item !== "string")) throw new HttpError(400, `${key} must be an array of strings`);
   return value as string[];
+};
+
+const tokenMatches = (provided: string, expected: string): boolean => {
+  const candidate = Buffer.from(provided);
+  const reference = Buffer.from(expected);
+  if (candidate.length !== reference.length) return false;
+  return timingSafeEqual(candidate, reference);
+};
+
+const readToken = (request: IncomingMessage): string => {
+  const authorization = request.headers.authorization;
+  if (typeof authorization === "string" && authorization.toLowerCase().startsWith("bearer ")) {
+    return authorization.slice(7).trim();
+  }
+  const custom = request.headers["x-agentswarm-token"];
+  if (typeof custom === "string") return custom.trim();
+  return "";
+};
+
+const requireToken = (request: IncomingMessage, url: URL, allowQueryToken = false): void => {
+  if (!config.sharedTokenRequired) return;
+  const provided = readToken(request) || (allowQueryToken ? url.searchParams.get("token")?.trim() ?? "" : "");
+  if (!provided || !tokenMatches(provided, config.sharedToken)) {
+    throw new HttpError(401, "A valid shared access token is required");
+  }
 };
 
 const mimeTypes: Record<string, string> = {
@@ -122,6 +148,7 @@ const parseProjectInput = (body: Record<string, unknown>): CreateProjectInput =>
 const parseTaskInput = (body: Record<string, unknown>): CreateTaskInput => ({
   title: stringValue(body, "title"),
   description: stringValue(body, "description"),
+  assignee: stringValue(body, "assignee", false) || undefined,
   provider: typeof body.provider === "string" ? body.provider as CreateTaskInput["provider"] : undefined,
   model: stringValue(body, "model", false) || undefined,
   dependencies: stringArray(body, "dependencies"),
@@ -137,6 +164,7 @@ const parsePlanInput = (body: Record<string, unknown>): PlanInput => {
     ? rawTasks.filter((task): task is Record<string, unknown> => Boolean(task && typeof task === "object")).map((task) => ({
         title: stringValue(task, "title"),
         description: stringValue(task, "description"),
+        assignee: stringValue(task, "assignee", false) || undefined,
         provider: typeof task.provider === "string" ? task.provider as CreateTaskInput["provider"] : undefined,
         dependencies: stringArray(task, "dependencies"),
         allowedPaths: stringArray(task, "allowedPaths"),
@@ -150,7 +178,7 @@ const parsePlanInput = (body: Record<string, unknown>): PlanInput => {
 export const createAppServer = (store: JsonStore = createStore(), orchestrator = new Orchestrator(store)) => {
   const server = createHttpServer(async (request, response) => {
     response.setHeader("access-control-allow-origin", "*");
-    response.setHeader("access-control-allow-headers", "content-type");
+    response.setHeader("access-control-allow-headers", "content-type, authorization, x-agentswarm-token");
     response.setHeader("access-control-allow-methods", "GET,POST,OPTIONS");
     if (request.method === "OPTIONS") {
       response.writeHead(204);
@@ -171,6 +199,7 @@ export const createAppServer = (store: JsonStore = createStore(), orchestrator =
         json(response, 200, { ok: true, service: "agentswarm" });
         return;
       }
+      requireToken(request, url, parts[1] === "projects" && parts[3] === "events");
       if (parts[1] === "providers" && request.method === "GET") {
         json(response, 200, { providers: await orchestrator.getProviders() });
         return;
@@ -232,6 +261,11 @@ export const createAppServer = (store: JsonStore = createStore(), orchestrator =
         json(response, 200, { task: await orchestrator.cancelTask(parts[2]) });
         return;
       }
+      if (parts[1] === "tasks" && parts[3] === "assign" && request.method === "POST") {
+        const body = await readBody(request);
+        json(response, 200, { task: await orchestrator.assignTask(parts[2], stringValue(body, "assignee", false)) });
+        return;
+      }
 
       if (parts[1] === "changes" && parts.length === 3 && request.method === "GET") {
         const change = store.getChange(parts[2]);
@@ -261,9 +295,16 @@ export const createAppServer = (store: JsonStore = createStore(), orchestrator =
 
 const isMain = process.argv[1] && fileURLToPath(import.meta.url) === resolve(process.argv[1]);
 if (isMain) {
+  if (config.sharedTokenMissing) {
+    console.error(
+      `Refusing to listen on ${config.host}: set AGENTSWARM_SHARED_TOKEN before binding a non-loopback address.`,
+    );
+    process.exit(1);
+  }
   const app = createAppServer();
   app.server.listen(config.port, config.host, () => {
-    console.log(`AgentSwarm listening on http://localhost:${config.port}`);
+    const authNote = config.sharedTokenRequired ? " (shared token required)" : " (loopback only, no token)";
+    console.log(`AgentSwarm listening on http://localhost:${config.port}${authNote}`);
   });
   const shutdown = async (): Promise<void> => {
     await app.orchestrator.shutdown();
