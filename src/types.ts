@@ -1,4 +1,4 @@
-export const PROVIDER_IDS = ["mock", "codex", "claude", "opencode", "custom"] as const;
+export const PROVIDER_IDS = ["mock", "codex", "claude", "opencode", "hermes", "custom"] as const;
 
 export type ProviderId = (typeof PROVIDER_IDS)[number];
 export type TaskStatus =

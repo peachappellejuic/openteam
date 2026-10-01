@@ -31,6 +31,7 @@ export const config = {
     codex: process.env.CODEX_COMMAND ?? "codex",
     claude: process.env.CLAUDE_COMMAND ?? "claude",
     opencode: process.env.OPENCODE_COMMAND ?? "opencode",
+    hermes: process.env.HERMES_COMMAND ?? "hermes",
     custom: process.env.AGENTSWARM_AGENT_COMMAND ?? "",
   },
 };

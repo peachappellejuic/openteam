@@ -9,7 +9,11 @@ import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
-const listen = async () => {
+const listen = async (token = "") => {
+  const previousToken = config.sharedToken;
+  const previousRequired = config.sharedTokenRequired;
+  config.sharedToken = token;
+  config.sharedTokenRequired = token.length > 0;
   const stateDirectory = await mkdtemp(join(tmpdir(), "agentswarm-server-"));
   const app = createAppServer(new JsonStore(join(stateDirectory, "state.json")));
   await new Promise<void>((resolve) => app.server.listen(0, "127.0.0.1", resolve));
@@ -21,16 +25,14 @@ const listen = async () => {
       await new Promise<void>((resolve) => app.server.close(() => resolve()));
       await app.store.flush();
       await rm(stateDirectory, { recursive: true, force: true }).catch(() => undefined);
+      config.sharedToken = previousToken;
+      config.sharedTokenRequired = previousRequired;
     },
   };
 };
 
 test("health stays open while api routes require the shared token", async () => {
-  const previous = config.sharedToken;
-  const previousRequired = config.sharedTokenRequired;
-  config.sharedToken = "s3cret-token";
-  config.sharedTokenRequired = true;
-  const server = await listen();
+  const server = await listen("s3cret-token");
   try {
     const health = await fetch(`${server.base}/api/health`);
     assert.equal(health.status, 200);
@@ -41,6 +43,9 @@ test("health stays open while api routes require the shared token", async () => 
     const wrong = await fetch(`${server.base}/api/projects`, { headers: { authorization: "Bearer nope" } });
     assert.equal(wrong.status, 401);
 
+    const wrongLength = await fetch(`${server.base}/api/projects`, { headers: { authorization: "Bearer s3cret" } });
+    assert.equal(wrongLength.status, 401, "a token prefix must not authenticate");
+
     const authorized = await fetch(`${server.base}/api/projects`, { headers: { authorization: "Bearer s3cret-token" } });
     assert.equal(authorized.status, 200);
     assert.deepEqual((await authorized.json()).projects, []);
@@ -48,14 +53,12 @@ test("health stays open while api routes require the shared token", async () => 
     const headerForm = await fetch(`${server.base}/api/projects`, { headers: { "x-agentswarm-token": "s3cret-token" } });
     assert.equal(headerForm.status, 200);
   } finally {
-    config.sharedToken = previous;
-    config.sharedTokenRequired = previousRequired;
     await server.close();
   }
 });
 
 test("routes stay open when no shared token is configured", async () => {
-  const server = await listen();
+  const server = await listen("");
   try {
     const response = await fetch(`${server.base}/api/projects`);
     assert.equal(response.status, 200);
@@ -65,18 +68,12 @@ test("routes stay open when no shared token is configured", async () => {
 });
 
 test("static assets are served without a token so the ui can prompt for one", async () => {
-  const previous = config.sharedToken;
-  const previousRequired = config.sharedTokenRequired;
-  config.sharedToken = "s3cret-token";
-  config.sharedTokenRequired = true;
-  const server = await listen();
+  const server = await listen("s3cret-token");
   try {
     const page = await fetch(`${server.base}/`);
     assert.equal(page.status, 200);
     assert.match(page.headers.get("content-type") ?? "", /text\/html/);
   } finally {
-    config.sharedToken = previous;
-    config.sharedTokenRequired = previousRequired;
     await server.close();
   }
 });

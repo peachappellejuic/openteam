@@ -41,6 +41,7 @@ const runProcess = async (
   command: string,
   args: string[],
   context: ProviderContext,
+  detectFailure?: (output: string) => string | undefined,
 ): Promise<ProviderResult> => {
   return new Promise((resolve, reject) => {
     let settled = false;
@@ -91,15 +92,41 @@ const runProcess = async (
     child.on("error", (error) => finish(() => reject(error)));
     child.on("close", (exitCode) => {
       const result = { output, exitCode: exitCode ?? 1 };
+      const reported = result.exitCode === 0 ? detectFailure?.(result.output) : undefined;
       finish(() => {
-        if (result.exitCode === 0) resolve(result);
+        if (reported) reject(new Error(reported));
+        else if (result.exitCode === 0) resolve(result);
         else reject(new Error(`${command} exited with code ${result.exitCode}`));
       });
     });
   });
 };
 
-const commandAdapter = (id: Exclude<ProviderId, "mock">, command: string, args: string[]): ProviderAdapter => ({
+interface CommandAdapterOptions {
+  promptFirst?: boolean;
+  extraArgs?: string[];
+  detectFailure?: (output: string) => string | undefined;
+}
+
+export const buildProviderArgs = (
+  id: ProviderId,
+  args: string[],
+  prompt: string,
+  model?: string,
+  options: CommandAdapterOptions = {},
+): string[] => {
+  const modelArgs = model && id !== "custom" ? ["--model", model] : [];
+  const extraArgs = options.extraArgs ?? [];
+  if (options.promptFirst) return [...args, prompt, ...extraArgs, ...modelArgs];
+  return [...args, ...extraArgs, ...modelArgs, prompt];
+};
+
+const commandAdapter = (
+  id: Exclude<ProviderId, "mock">,
+  command: string,
+  args: string[],
+  options: CommandAdapterOptions = {},
+): ProviderAdapter => ({
   id,
   command,
   isAvailable: async () => {
@@ -122,10 +149,22 @@ const commandAdapter = (id: Exclude<ProviderId, "mock">, command: string, args: 
     });
   },
   run: (context) => {
-    const modelArgs = context.task.model && id !== "custom" ? ["--model", context.task.model] : [];
-    return runProcess(command, [...args, ...modelArgs, buildPrompt(context.task)], context);
+    const argv = buildProviderArgs(id, args, buildPrompt(context.task), context.task.model, options);
+    return runProcess(command, argv, context, options.detectFailure);
   },
 });
+
+// `hermes -z` reports provider and credential failures on stdout and still exits 0,
+// so a failed run would otherwise look like a clean success. Only the first line is
+// inspected, and only against hermes' own diagnostic prefixes, so ordinary agent
+// prose that happens to mention an error is not mistaken for a failure.
+export const hermesFailure = (output: string): string | undefined => {
+  const firstLine = output.trimStart().split("\n", 1)[0]?.trim() ?? "";
+  if (!firstLine) return undefined;
+  if (/^API call failed after \d+ retries:/i.test(firstLine)) return firstLine;
+  if (/^hermes\b.*\bagent failed:/i.test(firstLine)) return firstLine;
+  return undefined;
+};
 
 const mockAdapter: ProviderAdapter = {
   id: "mock",
@@ -152,6 +191,14 @@ const adapters: Record<ProviderId, ProviderAdapter> = {
   codex: commandAdapter("codex", config.commands.codex, ["exec", "--json", "--sandbox", "workspace-write"]),
   claude: commandAdapter("claude", config.commands.claude, ["-p", "--permission-mode", "acceptEdits", "--no-session-persistence"]),
   opencode: commandAdapter("opencode", config.commands.opencode, ["run"]),
+  // `hermes -z PROMPT` binds PROMPT to the -z flag, so the prompt must precede
+  // --model or argparse errors with "argument -z/--oneshot: expected one argument".
+  // --accept-hooks keeps headless runs from blocking on unseen hooks in config.yaml.
+  hermes: commandAdapter("hermes", config.commands.hermes, ["-z"], {
+    promptFirst: true,
+    extraArgs: ["--accept-hooks"],
+    detectFailure: hermesFailure,
+  }),
   custom: commandAdapter("custom", config.commands.custom, []),
 };
 
