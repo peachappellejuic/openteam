@@ -11,6 +11,7 @@ try {
 const port = Number.parseInt(process.env.PORT ?? "4317", 10);
 const host = process.env.HOST ?? "127.0.0.1";
 const sharedToken = (process.env.AGENTSWARM_SHARED_TOKEN ?? "").trim();
+const maxConcurrentRuns = Number.parseInt(process.env.AGENTSWARM_MAX_CONCURRENCY ?? "4", 10);
 
 export const isLoopbackHost = (value: string): boolean => value === "127.0.0.1" || value === "localhost" || value === "::1";
 
@@ -27,6 +28,8 @@ export const config = {
   maxEvents: 5000,
   agentTimeoutMs: 30 * 60 * 1000,
   commandTimeoutMs: 10 * 60 * 1000,
+  /** Simultaneous agents per process. Every agent clones the repo and spends tokens. */
+  maxConcurrentRuns: Number.isFinite(maxConcurrentRuns) && maxConcurrentRuns > 0 ? maxConcurrentRuns : 4,
   commands: {
     codex: process.env.CODEX_COMMAND ?? "codex",
     claude: process.env.CLAUDE_COMMAND ?? "claude",

@@ -3,6 +3,7 @@ import { mkdirSync, rmSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
 import { promisify } from "node:util";
 import { config } from "./config.js";
+import { terminate } from "./spawn.js";
 
 const execFileAsync = promisify(execFile);
 
@@ -182,9 +183,35 @@ export const removeWorkspace = async (workspacePath: string): Promise<void> => {
   rmSync(resolve(workspacePath), { recursive: true, force: true });
 };
 
+export interface PushResult {
+  sourceBranch: string;
+  destinationRef: string;
+  output: string;
+}
+
+/**
+ * Publishes a branch held in the managed mirror back to the origin repository.
+ * Merges only ever move the mirror, so this is the only way AgentSwarm work
+ * reaches the repository the user actually works in.
+ */
+export const pushMirrorBranch = async (
+  mirrorPath: string,
+  sourceBranch: string,
+  destinationRef: string,
+): Promise<PushResult> => {
+  const output = await runGit(["push", "origin", `refs/heads/${sourceBranch}:${destinationRef}`], mirrorPath);
+  return { sourceBranch, destinationRef, output };
+};
+
 export const verifyWorkspace = async (workspacePath: string, command: string): Promise<{ exitCode: number; output: string }> => {
   return new Promise((resolvePromise) => {
-    const child = spawn("/bin/sh", ["-lc", command], { cwd: workspacePath, stdio: ["ignore", "pipe", "pipe"] });
+    // Detached so a runaway verification command and its children can all be
+    // signalled together; see terminate().
+    const child = spawn("/bin/sh", ["-lc", command], {
+      cwd: workspacePath,
+      detached: process.platform !== "win32",
+      stdio: ["ignore", "pipe", "pipe"],
+    });
     let output = "";
     let settled = false;
     let timer: ReturnType<typeof setTimeout>;
@@ -198,7 +225,7 @@ export const verifyWorkspace = async (workspacePath: string, command: string): P
       output = `${output}${chunk.toString()}`.slice(-64_000);
     };
     timer = setTimeout(() => {
-      child.kill("SIGTERM");
+      terminate(child);
       finish({ exitCode: 124, output: `${output}\nVerification timed out` });
     }, config.commandTimeoutMs);
     child.stdout?.on("data", collect);

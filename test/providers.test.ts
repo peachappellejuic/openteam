@@ -1,7 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { buildProviderArgs, getAdapter, hermesFailure, listProviders } from "../src/providers.js";
-import { PROVIDER_IDS } from "../src/types.js";
+import { knownProviderIds } from "../src/providers.js";
 import { config } from "../src/config.js";
 
 const prompt = "PROMPT";
@@ -31,10 +31,10 @@ test("the custom provider never receives a model flag", () => {
 });
 
 test("every provider id has an adapter", () => {
-  for (const id of PROVIDER_IDS) {
+  for (const id of knownProviderIds()) {
     assert.ok(getAdapter(id), `missing adapter for ${id}`);
   }
-  assert.ok(PROVIDER_IDS.includes("hermes"));
+  assert.ok(knownProviderIds().includes("hermes"));
 });
 
 test("providers report availability by probing the command", async () => {

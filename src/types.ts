@@ -1,6 +1,16 @@
-export const PROVIDER_IDS = ["mock", "codex", "claude", "opencode", "hermes", "custom"] as const;
+/**
+ * Agent CLIs openteam shells out to.
+ *
+ * The full provider list is dynamic: built-in API providers plus whatever the
+ * user has added with `openteam provider add`, so the id cannot be a literal
+ * union at the type level.
+ */
+export const CLI_PROVIDER_IDS = ["mock", "codex", "claude", "opencode", "hermes", "custom"] as const;
 
-export type ProviderId = (typeof PROVIDER_IDS)[number];
+export const CLI_PROVIDER_SET: ReadonlySet<string> = new Set(CLI_PROVIDER_IDS);
+
+export type CliProviderId = (typeof CLI_PROVIDER_IDS)[number];
+export type ProviderId = string;
 export type TaskStatus =
   | "queued"
   | "running"
@@ -115,9 +125,25 @@ export interface CreateTaskInput {
   parentId?: string;
 }
 
+/** One step of a plan. `dependsOn` holds indices into the same array. */
+export type PlanTaskInput = Pick<
+  CreateTaskInput,
+  "title" | "description" | "assignee" | "provider" | "allowedPaths" | "acceptanceTests" | "verifyCommand"
+> & {
+  dependencies?: string[];
+  /** Zero-based indices of earlier tasks that must finish first. */
+  dependsOn?: number[];
+};
+
 export interface PlanInput {
   goal: string;
-  tasks?: Array<Pick<CreateTaskInput, "title" | "description" | "assignee" | "provider" | "dependencies" | "allowedPaths" | "acceptanceTests" | "verifyCommand">>;
+  tasks?: PlanTaskInput[];
+  /** Used for generated steps that do not name their own provider. */
+  provider?: ProviderId;
+  model?: string;
+  allowedPaths?: string[];
+  verifyCommand?: string;
+  assignee?: string;
 }
 
 export interface ProjectSnapshot {

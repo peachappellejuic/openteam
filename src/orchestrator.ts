@@ -18,7 +18,7 @@ import {
   type SyncResult,
 } from "./git.js";
 import { newId, now } from "./ids.js";
-import { ensureProviderAvailable, getAdapter, listProviders } from "./providers.js";
+import { ensureProviderAvailable, getAdapter, knownProviderIds, listProviders } from "./providers.js";
 import type { JsonStore } from "./store.js";
 import type {
   AppEvent,
@@ -32,22 +32,90 @@ import type {
   Run,
   Task,
 } from "./types.js";
-import { PROVIDER_IDS } from "./types.js";
 
 const truncate = (value: string, length = 12_000): string => value.length > length ? `${value.slice(0, length)}\n…` : value;
 
-const pathAllowed = (file: string, patterns: string[]): boolean => patterns.some((pattern) => {
-  const normalized = pattern.replace(/^\.\//, "").replace(/\/$/, "");
-  if (normalized === "*" || normalized === "**") return true;
-  if (normalized.endsWith("/*")) return file.startsWith(`${normalized.slice(0, -2)}/`);
-  return file === normalized || file.startsWith(`${normalized}/`);
-});
+const pathAllowed = (file: string, patterns: string[]): boolean => {
+  const normalized = patternOf(file);
+  return patterns.some((pattern) => covers(pattern, normalized));
+};
+
+/** The literal prefix of a pattern, so a glob can still be reasoned about. */
+const patternOf = (value: string): string => value.replace(/^\.\//, "").replace(/\/$/, "");
+
+/**
+ * Glob matching for allowed paths.
+ *
+ * A wildcard-free pattern is treated as a directory, so `src` covers everything
+ * beneath it. Otherwise `*` stays inside one path segment, `**` crosses
+ * separators, and `?` is a single character. A bare `*` or `**` still means the
+ * whole repository.
+ */
+export const covers = (rawPattern: string, file: string): boolean => {
+  const pattern = patternOf(rawPattern);
+  if (pattern === "*" || pattern === "**") return true;
+  if (!/[*?[]/.test(pattern)) return file === pattern || file.startsWith(`${pattern}/`);
+  const source = pattern
+    .split("")
+    .map((character, index) => {
+      if (character === "*") return pattern[index + 1] === "*" ? ".*" : "[^/]*";
+      if (character === "?") return "[^/]";
+      return character.replace(/[.+^${}()|[\]\\]/g, "\\$&");
+    })
+    .join("");
+  try {
+    return new RegExp(`^${source}$`).test(file);
+  } catch {
+    return false;
+  }
+};
+
+/** The directory a pattern is anchored at, ignoring any wildcard tail. */
+const scopeRoot = (pattern: string): string => {
+  const normalized = patternOf(pattern);
+  const wildcard = normalized.search(/[*?[{]/);
+  const root = wildcard === -1 ? normalized : normalized.slice(0, wildcard);
+  const cut = root.lastIndexOf("/");
+  return cut === -1 ? "" : root.slice(0, cut);
+};
+
+/**
+ * Whether two tasks could plausibly touch the same file.
+ *
+ * An empty allow list means the whole repository, which collides with everything.
+ * Wildcards are compared by the directory they are anchored at, which is
+ * deliberately pessimistic: a false positive costs a short wait, a false negative
+ * costs a merge conflict discovered after a full agent run.
+ */
+export const scopesOverlap = (left: string[], right: string[]): boolean => {
+  if (!left.length || !right.length) return true;
+  if ([...left, ...right].some((pattern) => pattern === "*" || pattern === "**")) return true;
+  for (const a of left) {
+    for (const b of right) {
+      if (covers(a, b) || covers(b, a)) return true;
+      const rootA = scopeRoot(a);
+      const rootB = scopeRoot(b);
+      if (!rootA || !rootB) return true;
+      if (rootA === rootB) return true;
+      if (rootA.startsWith(`${rootB}/`) || rootB.startsWith(`${rootA}/`)) return true;
+    }
+  }
+  return false;
+};
 
 export class Orchestrator {
   private readonly activeRuns = new Map<string, AbortController>();
   private readonly startingTasks = new Set<string>();
+  private readonly cancelledTasks = new Set<string>();
+  /** Tasks dispatched by this instance. Shutdown only ever settles these, so a
+   * second process working the same state file is left alone. */
+  private readonly ownedTasks = new Set<string>();
+  /** Task ids currently occupying a concurrency slot. */
+  private readonly runningTasks = new Set<string>();
   private readonly pendingStarts = new Set<Promise<void>>();
   private readonly syncOperations = new Map<string, Promise<SyncResult>>();
+  /** Why a ready task was not started, surfaced instead of silently waiting. */
+  private readonly deferred = new Map<string, string>();
 
   public constructor(private readonly store: JsonStore) {}
 
@@ -104,14 +172,14 @@ export class Orchestrator {
     }
   }
 
-  public async createTask(projectId: string, input: CreateTaskInput): Promise<Task> {
+  public async createTask(projectId: string, input: CreateTaskInput, options: { dispatch?: boolean } = {}): Promise<Task> {
     const project = this.requireProject(projectId);
     const title = input.title.trim();
     const description = input.description.trim();
     if (!title) throw new Error("Task title is required");
     if (!description) throw new Error("Task description is required");
     const provider = input.provider ?? "mock";
-    if (!PROVIDER_IDS.includes(provider)) throw new Error(`Unsupported provider: ${provider}`);
+    if (!getAdapter(provider)) throw new Error(`Unsupported provider: ${provider}`);
     const dependencies = [...new Set(input.dependencies ?? [])];
     for (const dependency of dependencies) {
       const task = this.store.getTask(dependency);
@@ -141,7 +209,8 @@ export class Orchestrator {
     };
     await this.store.createTask(task);
     await this.event({ projectId, taskId: id, type: "task.created", message: `Task queued: ${title}` });
-    this.dispatchInBackground(projectId);
+    // Callers that only record the task pass `dispatch: false` and start it later.
+    if (options.dispatch !== false) this.dispatchInBackground(projectId);
     return task;
   }
 
@@ -157,29 +226,41 @@ export class Orchestrator {
           {
             title: "Inspect and design",
             description: `Inspect the repository and produce an implementation outline for: ${goal}`,
-            provider: "mock" as ProviderId,
           },
           {
             title: "Implement the change",
             description: `Implement the requested goal in the repository: ${goal}`,
-            provider: "mock" as ProviderId,
           },
           {
             title: "Verify and integrate",
             description: `Review the implementation, run the project's verification commands, and report any remaining issues for: ${goal}`,
-            provider: "mock" as ProviderId,
           },
         ];
     const created: Task[] = [];
     for (const [index, template] of templates.entries()) {
-      const dependencies = template.dependencies?.length
-        ? template.dependencies
-        : index === 0 ? [] : index === 1 ? [created[0]?.id ?? ""] : [created[1]?.id ?? ""];
+      // Indices from a coordinator plan resolve against tasks already created,
+      // so a plan can express a DAG without knowing the generated ids. An
+      // explicitly empty list means "runs in parallel" and must not fall through
+      // to the default chain, which is only for templates that said nothing.
+      const explicitIndexes = template.dependsOn !== undefined;
+      const indexed = (template.dependsOn ?? [])
+        .filter((value) => Number.isInteger(value) && value >= 0 && value < created.length)
+        .map((value) => created[value].id);
+      const dependencies = explicitIndexes
+        ? indexed
+        : template.dependencies?.length
+          ? template.dependencies
+          : index === 0 ? [] : index === 1 ? [created[0]?.id ?? ""] : [created[1]?.id ?? ""];
       const task = await this.createTask(projectId, {
         ...template,
         title: template.title.trim(),
         description: template.description.trim(),
         parentId: planId,
+        provider: template.provider ?? input.provider,
+        model: input.model,
+        assignee: template.assignee ?? input.assignee,
+        allowedPaths: template.allowedPaths ?? input.allowedPaths,
+        verifyCommand: template.verifyCommand ?? input.verifyCommand,
         dependencies: dependencies.filter(Boolean),
       });
       created.push(task);
@@ -208,7 +289,7 @@ export class Orchestrator {
     if (!task) throw new Error("Task not found");
     if (["running", "completed", "cancelled"].includes(task.status)) return task;
     this.assertDependencies(task);
-    this.trackStart(this.startTask(task));
+    this.startTracked(task);
     return this.store.getTask(taskId) ?? task;
   }
 
@@ -218,14 +299,84 @@ export class Orchestrator {
       if (task.status !== "queued" && task.status !== "blocked") continue;
       if (!this.dependenciesComplete(task)) continue;
       if (this.startingTasks.has(task.id)) continue;
-      this.trackStart(this.startTask(task));
+
+      // Order matters: the scope check is cheaper than a slot, and a task that
+      // would collide should wait for a peer rather than for the cap.
+      const blocker = this.collisionReason(task);
+      if (blocker) {
+        if (this.deferred.get(task.id) !== blocker) {
+          this.deferred.set(task.id, blocker);
+          await this.event({ projectId, taskId: task.id, type: "task.deferred", message: blocker });
+        }
+        continue;
+      }
+      if (this.runningTasks.size >= config.maxConcurrentRuns) {
+        const reason = `Waiting for a free slot: ${this.runningTasks.size} of ${config.maxConcurrentRuns} agents are running`;
+        if (this.deferred.get(task.id) !== reason) {
+          this.deferred.set(task.id, reason);
+          await this.event({ projectId, taskId: task.id, type: "task.deferred", message: reason });
+        }
+        continue;
+      }
+      this.deferred.delete(task.id);
+      this.startTracked(task);
     }
+  }
+
+  /**
+   * The already-running task this one would fight with, if any.
+   *
+   * Only tasks that both *declare* a scope are compared. A task without
+   * `allowedPaths` may touch anything, so treating it as a collision would
+   * serialise every ordinary task against every other; git already refuses the
+   * unsafe merge afterwards. Declaring `--paths` on both sides is what opts a pair
+   * into avoiding a conflict that could be predicted for free.
+   */
+  private collisionReason(task: Task): string | undefined {
+    if (!task.allowedPaths.length) return undefined;
+    for (const taskId of this.runningTasks) {
+      const other = this.store.getTask(taskId);
+      if (!other?.allowedPaths.length) continue;
+      if (scopesOverlap(task.allowedPaths, other.allowedPaths)) {
+        return `Waiting for ${other.title}: it is already editing ${task.allowedPaths.join(", ")}`;
+      }
+    }
+    return undefined;
+  }
+
+  /** Overlapping scopes among currently running tasks, for reporting. */
+  public collisions(projectId: string): Array<{ left: Task; right: Task }> {
+    const running = [...this.runningTasks]
+      .map((taskId) => this.store.getTask(taskId))
+      .filter((task): task is Task => task !== undefined)
+      .filter((task) => task.projectId === projectId && task.allowedPaths.length > 0);
+    const pairs: Array<{ left: Task; right: Task }> = [];
+    for (const [index, left] of running.entries()) {
+      for (const right of running.slice(index + 1)) {
+        if (scopesOverlap(left.allowedPaths, right.allowedPaths)) pairs.push({ left, right });
+      }
+    }
+    return pairs;
+  }
+
+  public deferredReasons(projectId: string): Array<{ taskId: string; reason: string }> {
+    return [...this.deferred]
+      .filter(([taskId]) => this.store.getTask(taskId)?.projectId === projectId)
+      .map(([taskId, reason]) => ({ taskId, reason }));
+  }
+
+  /** Agents currently occupying a slot. */
+  public runningCount(): number {
+    return this.runningTasks.size;
   }
 
   public async cancelTask(taskId: string): Promise<Task> {
     const task = this.store.getTask(taskId);
     if (!task) throw new Error("Task not found");
     if (["completed", "cancelled"].includes(task.status)) return task;
+    // Recorded separately from the status because startTask flips the task back
+    // to `running` after its sync, which would otherwise resurrect a cancelled one.
+    this.cancelledTasks.add(taskId);
     this.activeRuns.get(task.runId ?? "")?.abort();
     const updated = await this.store.updateTask(taskId, { status: "cancelled", completedAt: now(), error: "Cancelled by user" });
     if (task.runId) await this.store.updateRun(task.runId, { status: "cancelled", finishedAt: now(), error: "Cancelled by user" });
@@ -298,7 +449,20 @@ export class Orchestrator {
     }
   }
 
-  public async shutdown(): Promise<void> {
+  /**
+   * `cancelPending` settles the queued and running work this instance started, so
+   * a caller that cannot keep supervising them — a short-lived CLI invocation —
+   * exits at once instead of draining background work it was told not to wait for.
+   */
+  public async shutdown(options: { cancelPending?: boolean } = {}): Promise<void> {
+    if (options.cancelPending) {
+      for (const taskId of [...this.ownedTasks]) {
+        const task = this.store.getTask(taskId);
+        if (task && task.status === "running") {
+          await this.cancelTask(taskId).catch(() => undefined);
+        }
+      }
+    }
     for (const controller of this.activeRuns.values()) controller.abort();
     await this.drain();
   }
@@ -311,6 +475,13 @@ export class Orchestrator {
     const tracked = promise.catch(() => undefined);
     this.pendingStarts.add(tracked);
     void tracked.finally(() => this.pendingStarts.delete(tracked));
+  }
+
+  private startTracked(task: Task): void {
+    if (this.startingTasks.has(task.id)) return;
+    this.ownedTasks.add(task.id);
+    this.runningTasks.add(task.id);
+    this.trackStart(this.startTask(task));
   }
 
   private requireProject(projectId: string): Project {
@@ -335,15 +506,30 @@ export class Orchestrator {
     if (!this.dependenciesComplete(task)) throw new Error("Task dependencies are not complete");
   }
 
+  private isCancelled(taskId: string): boolean {
+    return this.cancelledTasks.has(taskId) || this.store.getTask(taskId)?.status === "cancelled";
+  }
+
+  /** Settles a cancelled task that a racing start may have flipped back to running. */
+  private async settleCancelled(taskId: string): Promise<boolean> {
+    if (!this.isCancelled(taskId)) return false;
+    if (this.store.getTask(taskId)?.status !== "cancelled") {
+      await this.store.updateTask(taskId, { status: "cancelled", completedAt: now(), error: "Cancelled by user" });
+    }
+    return true;
+  }
+
   private async startTask(task: Task): Promise<void> {
-    if (this.startingTasks.has(task.id)) return;
-    this.startingTasks.add(task.id);
     let project: Project | undefined;
     let runId: string | undefined;
     let startedTask: Task | undefined;
     try {
+      // The guard sits inside the try so a duplicate start still releases the
+      // concurrency slot its caller already reserved.
+      if (this.startingTasks.has(task.id)) return;
+      this.startingTasks.add(task.id);
       project = this.requireProject(task.projectId);
-      if (this.store.getTask(task.id)?.status === "cancelled") return;
+      if (await this.settleCancelled(task.id)) return;
       try {
         await this.syncProject(project.id);
       } catch (error) {
@@ -364,7 +550,7 @@ export class Orchestrator {
         startedAt: timestamp,
         error: undefined,
       });
-      if (!updated || this.store.getTask(task.id)?.status === "cancelled") return;
+      if (!updated || (await this.settleCancelled(task.id))) return;
       startedTask = updated;
       const run: Run = {
         id: runId,
@@ -380,7 +566,7 @@ export class Orchestrator {
 
       await mkdir(join(config.dataDir, "workspaces", project.id), { recursive: true });
       await getWorkspace(project.managedRepositoryPath, workspacePath, baseSha, branch);
-      if (this.store.getTask(task.id)?.status === "cancelled") {
+      if (await this.settleCancelled(task.id)) {
         controller.abort();
         return;
       }
@@ -398,7 +584,7 @@ export class Orchestrator {
         },
       });
 
-      if (this.store.getTask(task.id)?.status === "cancelled") return;
+      if (await this.settleCancelled(task.id)) return;
       if (task.verifyCommand) {
         const verification = await verifyWorkspace(workspacePath, task.verifyCommand);
         await this.event({
@@ -454,12 +640,17 @@ export class Orchestrator {
     } finally {
       if (runId) this.activeRuns.delete(runId);
       this.startingTasks.delete(task.id);
+      this.cancelledTasks.delete(task.id);
+      this.ownedTasks.delete(task.id);
+      // Free the slot before re-dispatching so a queued task can take it.
+      this.runningTasks.delete(task.id);
+      this.deferred.delete(task.id);
       if (project) this.dispatchInBackground(project.id);
     }
   }
 
   private async failTask(task: Task, error: unknown, runId = task.runId): Promise<void> {
-    if (this.store.getTask(task.id)?.status === "cancelled") return;
+    if (this.isCancelled(task.id)) return;
     const message = truncate(error instanceof Error ? error.message : "Agent run failed", 4000);
     await this.store.updateTask(task.id, { status: "failed", completedAt: now(), error: message });
     if (runId) await this.store.updateRun(runId, { status: "failed", finishedAt: now(), error: message });

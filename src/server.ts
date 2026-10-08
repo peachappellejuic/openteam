@@ -293,23 +293,35 @@ export const createAppServer = (store: JsonStore = createStore(), orchestrator =
   return { server, store, orchestrator };
 };
 
+export const startAppServer = async (store?: JsonStore, orchestrator?: Orchestrator) => {
+  if (config.sharedTokenMissing) {
+    throw new Error(`Refusing to listen on ${config.host}: set AGENTSWARM_SHARED_TOKEN before binding a non-loopback address.`);
+  }
+  const app = createAppServer(store, orchestrator);
+  await new Promise<void>((resolve, reject) => {
+    app.server.once("error", reject);
+    app.server.listen(config.port, config.host, () => resolve());
+  });
+  return {
+    app,
+    close: async (): Promise<void> => {
+      await app.orchestrator.shutdown();
+      await new Promise<void>((resolve) => app.server.close(() => resolve()));
+    },
+  };
+};
+
 const isMain = process.argv[1] && fileURLToPath(import.meta.url) === resolve(process.argv[1]);
 if (isMain) {
-  if (config.sharedTokenMissing) {
-    console.error(
-      `Refusing to listen on ${config.host}: set AGENTSWARM_SHARED_TOKEN before binding a non-loopback address.`,
-    );
-    process.exit(1);
-  }
-  const app = createAppServer();
-  app.server.listen(config.port, config.host, () => {
-    const authNote = config.sharedTokenRequired ? " (shared token required)" : " (loopback only, no token)";
-    console.log(`AgentSwarm listening on http://localhost:${config.port}${authNote}`);
-  });
-  const shutdown = async (): Promise<void> => {
-    await app.orchestrator.shutdown();
-    app.server.close();
-  };
-  process.once("SIGINT", () => void shutdown());
-  process.once("SIGTERM", () => void shutdown());
+  startAppServer()
+    .then(({ close }) => {
+      const authNote = config.sharedTokenRequired ? " (shared token required)" : " (loopback only, no token)";
+      console.log(`AgentSwarm listening on http://localhost:${config.port}${authNote}`);
+      process.once("SIGINT", () => void close());
+      process.once("SIGTERM", () => void close());
+    })
+    .catch((error: unknown) => {
+      console.error(error instanceof Error ? error.message : "Server failed to start");
+      process.exit(1);
+    });
 }
