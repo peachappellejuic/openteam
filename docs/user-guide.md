@@ -81,7 +81,13 @@ All settings come from the environment; `.env` is loaded automatically at startu
 | `CLAUDE_COMMAND` | `claude` | |
 | `OPENCODE_COMMAND` | `opencode` | |
 | `HERMES_COMMAND` | `hermes` | |
+| `ANTIGRAVITY_COMMAND` | `agy` | Antigravity's client is `agy`, not `antigravity` |
 | `AGENTSWARM_AGENT_COMMAND` | *(empty)* | Command for the `custom` provider |
+| `AGENTSWARM_ANTIGRAVITY_PERMISSIONS` | *(unset)* | `ask` stops auto-approving every tool call (§5.6) |
+| `AGENTSWARM_ANTIGRAVITY_ARGS` | *(empty)* | Extra flags for `agy`, e.g. `--effort high` |
+
+`--reviewer` (§5.8) takes a provider id rather than an environment variable; it is
+per task, so it can differ from run to run.
 | `AGENTSWARM_MAX_CONCURRENCY` | `4` | Simultaneous agents per process |
 | `NO_COLOR` | *(unset)* | Disables colour, as does `--no-color` |
 
@@ -295,11 +301,23 @@ that directory's immediate children.
 
 ## 5. Agents
 
-Choose an agent per task with `--provider`. Availability is probed with
-`<command> --version`, which must exit 0 within two seconds; `openteam providers` or
+Choose an agent per task with `--provider`. Availability is probed by running
+`<command> --version` and seeing whether it is there; `openteam providers` or
 `openteam doctor` reports the result, and an unavailable agent fails the task rather
 than being selected. In the web UI, an unavailable agent cannot be chosen from the
 dropdown.
+
+`--provider` takes one agent, a comma-separated list, or `all`:
+
+| Value | Queues |
+| --- | --- |
+| `--provider claude` | one task, on Claude |
+| `--provider codex,claude` | one task per agent, same instruction |
+| `--provider all` | one task per *installed* agent CLI |
+| *(omitted)* | one task; the orchestrator's default |
+
+Each copy gets its own mirror, so they edit in isolation and produce separate,
+independently reviewable diffs. See §5.7 for the workflow this is usually used for.
 
 There are two kinds of agent.
 
@@ -314,6 +332,7 @@ which is the only option when no agent CLI is installed for a service.
 | `claude` | `claude -p --permission-mode acceptEdits --no-session-persistence [--model M] <prompt>` |
 | `opencode` | `opencode run [--model M] <prompt>` |
 | `hermes` | `hermes -z <prompt> --accept-hooks [--model M]` |
+| `antigravity` | `agy -p <prompt> --output-format stream-json --print-timeout 29m --dangerously-skip-permissions [--model M]` |
 | `custom` | Whatever `AGENTSWARM_AGENT_COMMAND` points at |
 
 Start with `mock` to confirm the pipeline works before spending tokens on a real agent:
@@ -466,7 +485,173 @@ legitimately writes prose about a failing test is not misreported.
 `--accept-hooks` is passed so a headless run cannot block waiting for approval of hooks
 declared in your `~/.hermes/config.yaml`.
 
-### 5.6 Choosing a model
+### 5.6 Antigravity specifics
+
+Google's Antigravity ships a terminal client called `agy`, which is run here in its
+headless mode: `agy -p <prompt>`. The prompt is bound to `-p` and must come
+immediately after it, so `--model` and the rest follow the prompt.
+
+**Authentication is the CLI's own.** `agy` authenticates from your OS keyring, or from
+a Gemini API key if you configured one in its settings. openteam does not hold those
+credentials and cannot supply them, so a headless run with no cached session fails with
+`authentication required`. Run `agy` once interactively to sign in. Stored
+`data/keys.json` entries are still passed into the child's environment, so a Gemini key
+set through `openteam keys set gemini` reaches it as `GEMINI_API_KEY`.
+
+**Tools are auto-approved, deliberately.** In headless mode there is nobody to ask, so
+anything configured as Ask is *soft-denied*: the run continues, exits 0, and prints a
+notice naming the tool. An agent that cannot run your test suite would then report
+success having verified nothing — a silent false result, which is the one failure mode
+this tool exists to avoid. So runs pass `--dangerously-skip-permissions` by default,
+which is safe *here* because each agent works in its own mirror clone and nothing
+merges until you review the diff.
+
+To behave more conservatively, set one of:
+
+```bash
+AGENTSWARM_ANTIGRAVITY_PERMISSIONS=ask              # stop auto-approving; expect denials
+AGENTSWARM_ANTIGRAVITY_ARGS=--sandbox               # keep commands in the terminal sandbox
+AGENTSWARM_ANTIGRAVITY_ARGS="--effort high --agent reviewer"
+```
+
+Anything in `AGENTSWARM_ANTIGRAVITY_ARGS` is split on whitespace and passed through, so
+it can override the defaults above.
+
+**Failures are read from the status, not the exit code.** The run uses
+`--output-format stream-json`, so each step streams as it happens and the last event
+reports `status` and `error`. This matters because a soft-denied run can still exit 0:
+openteam reads the terminal status and fails the task on anything other than `SUCCESS`.
+Agent prose that mentions `ERROR` is not mistaken for a status, because only whole JSON
+objects are considered.
+
+**Models are checked.** `--model` takes a slug from `agy models`, and headless mode
+exits non-zero rather than quietly running a different model. A bad slug is reported
+with the list command attached.
+
+**Time budget.** `agy` gives up on its own after five minutes by default, which is
+shorter than this tool's agent timeout, so `--print-timeout` is set from that timeout
+(less a margin). Otherwise the CLI would abandon long runs and the harness would have
+killed them with no explanation.
+
+### 5.7 Running several agents at once
+
+Because every agent authenticates with its own CLI, nothing stops you from using
+several at the same time — each keeps its own login, and openteam only has to start
+the process. `--provider all` queues your instruction once per installed agent:
+
+```bash
+openteam "add caching to the user lookup" --provider all
+```
+
+```
+queued 5 tasks across codex, claude, opencode, hermes, antigravity
+review each diff and merge the one you want; merging two will conflict
+```
+
+They run concurrently, limited by `AGENTSWARM_MAX_CONCURRENCY` (4 by default); the
+others wait for a slot and the summary says so rather than appearing stalled.
+
+In the TUI the same thing is two keystrokes — `--provider ` opens the list, and `all`
+is the first row:
+
+```
+providers  1
+› all  5 agents  one task each, in parallel
+```
+
+The usual use is **competing answers on one problem**: five agents attempt the same
+instruction, you read five diffs, and you merge the one you want. Merge exactly one —
+the rest are alternatives, and merging two will conflict. To throw the others away:
+
+```bash
+openteam changes                # every diff still awaiting review
+openteam cancel <task-id>       # drop a task you did not pick
+```
+
+`/changes` in the TUI lists the same review queue, and `↑` `↓` then `→` opens a diff
+inline so comparing five of them does not mean leaving the board.
+
+If instead you want *different* agents on *different* parts of the same job, queue
+them as separate instructions with `--paths` each — that is what the collision guard
+is for, and it will run them one at a time rather than let them fight over a file.
+
+Two things to know:
+
+- **`all` means installed agent CLIs only.** It skips `mock` (which does no work) and
+  `custom` (usually one of the others under another name). Direct API providers are
+  left out because each is billed per token; name one explicitly to include it.
+- **`--paths` defeats the parallelism.** Copies declaring the same paths collide by
+  design, so they run one at a time. The queue says so when that happens.
+
+`openteam plan` takes a single provider: a plan already splits the goal into several
+tasks, and fanning each of those out again would multiply the work instead of
+parallelising it.
+
+### 5.8 Letting a model review the diff
+
+`--reviewer <id>` puts a second model between the agent and the review queue. It
+reads the diff and returns one of three verdicts:
+
+| Verdict | What happens |
+| --- | --- |
+| `approve` | the change is approved **and merged into the managed mirror** |
+| `request-changes` | it stays `pending`, with the reviewer's reasons attached |
+| `abstain` | it stays `pending`; the reviewer would not commit |
+
+```bash
+openteam "add caching to the user lookup" --provider codex --reviewer claude
+```
+
+```
+03:30:05 ○ Reviewed and approved: the caching is keyed correctly and covered by a test
+03:30:05 ● Change approved for merge
+03:30:05 ✔ Change merged as 9e99fb5f295b6842007af82d3cc733d7d93cd6a2
+merged 9e99fb5f29  AgentSwarm: add caching to the user lookup
+review approve by claude (auto-approved)
+  the caching is keyed correctly and covered by a test
+```
+
+**Publishing is still yours.** The automatic merge lands in the managed mirror and
+nothing else. Nothing reaches a branch you work on until you run `openteam push`.
+
+**The reviewer must be a different provider from the one that wrote the change.**
+Same provider is refused up front:
+
+```bash
+openteam "..." --provider claude --reviewer claude
+error `--reviewer claude` is the same as `--provider claude`, so it would be
+       reviewing its own work. Pick another reviewer, or run the agent without one.
+```
+
+Self-review is not review: the model repeats the mistakes it just made, and those
+are precisely the ones it will not notice. With `--provider all --reviewer claude`,
+the other copies are still reviewed and only the `claude` one is skipped.
+
+**Either kind of provider can review.** A direct API endpoint (openai, anthropic,
+gemini, your own) is called with the diff as text. An agent CLI is invoked with the
+same flags it would use for work, minus the sandbox and auto-approval flags, so a
+reviewer is not handed the keys to the repository. That matters because most people
+are signed in through their CLIs rather than holding API keys.
+
+**What no verdict can override.** `--verify` and `--paths` are checked before the
+reviewer is ever called; a failing test fails the task and no change exists to
+review:
+
+```bash
+openteam "..." --provider claude --reviewer claude --verify "npm test"
+✖ Verification exited with 1
+failed  Verification command failed: npm test
+```
+
+**When it abstains.** An unrecognised reply, an unreadable answer, a provider with no
+key, or a reviewer that is neither an endpoint nor an installed CLI all abstain. That
+is deliberate: the alternative would be a reviewer that approves anything it cannot
+parse.
+
+Use `--review-model` to pin the reviewer's model independently of the agent's
+(`--model`). Worth doing — a small model reviewing a strong one is not a check.
+
+### 5.9 Choosing a model
 
 Set `--model` on the task, or leave it blank to use the agent's own default. The value
 is passed through verbatim, so use whatever identifier your agent expects
@@ -560,9 +745,76 @@ openteam keys test                # one live request per configured provider
 openteam keys test groq ollama    # just these
 ```
 
-Inside a session, `/keys` prints the same table. There is deliberately no `/keys set`:
-a credential typed into a prompt inside an agent session would be echoed into the
-transcript.
+Inside a session, `/keys` prints the same table.
+
+### 6.4 `/provider`: setting a key without leaving the TUI
+
+`/provider` opens a menu rather than making you remember the command:
+
+```
+› /provider  set a key, or add a provider
+```
+
+Enter on it and you get every provider, split into what you can use right now and
+what still needs something:
+
+```
+providers  15  (5 not shown)
+› ollama                 local
+  claude                 agent cli
+  my-vllm key stored     direct api
+  openai needs a key     direct api
+  anthropic needs a key  direct api
+  5 more; keep typing to narrow
+```
+
+Nothing is hidden: the providers you cannot use yet are still listed, with what they
+need, because finding out a provider exists is the point of the menu. Arrow keys
+move, `enter` configures, `esc` leaves.
+
+Choosing a provider that needs a key asks for the value without echoing it, so the
+credential never appears on screen:
+
+```
+the value is not echoed  •  enter saves and tests it  •  esc to cancel
+credential — GROQ_API_KEY
+› ************
+```
+
+`enter` stores it and then makes one live request against that provider, so you are
+told whether it worked instead of finding out on the next task. Re-entering a
+provider that already has a key says so, and replaces it. An empty `enter` changes
+nothing. Providers that authenticate through their own CLI, and local servers that
+need no key, say so rather than asking for a value that would be ignored.
+
+`+ add a provider` is the last row, and walks a short form:
+
+| Step | Asked for | Notes |
+| --- | --- | --- |
+| id | lowercase name | `a-z 0-9 . - _`, up to 32 characters; must be new |
+| wire format | openai, anthropic, gemini | a menu, not free text |
+| base url | `http://127.0.0.1:8000` | must start with `http://` or `https://` |
+| key variable | `MY_VLLM_API_KEY` | suggested from the id; type `skip` for none |
+| default model | any text | optional |
+
+Each field is checked before you move on, so a typo is refused at the point you made
+it rather than at first use:
+
+```
+1-32 characters of a-z, 0-9, dot, dash, underscore
+lowercase, e.g. my-vllm  •  enter to continue  •  esc to cancel
+add provider — id
+› My VLLM!
+```
+
+A url on `127.0.0.1`, `localhost`, `::1`, or `0.0.0.0` is taken to be a local
+server, so the key variable is skipped and the form ends without asking for a
+credential it would never send. The finished provider is written to
+`data/providers.json`, its key to `data/keys.json` at mode `0600`, and it appears in
+the menu immediately, already highlighted.
+
+`ctrl-u` clears the current field, `esc` cancels the whole form without writing
+anything.
 
 `keys set` writes `data/keys.json` with mode `0600`, via a temporary file and an
 atomic rename. Nothing else in the CLI ever prints a key: listings show a prefix and
@@ -570,7 +822,7 @@ the last four characters (`sk-…mnop`), and an error from a provider reports th
 key was rejected rather than repeating it. A corrupt or unreadable file is treated as
 absent rather than fatal, and the next `set` rewrites it.
 
-### 6.4 Checking them
+### 6.5 Checking them
 
 `openteam keys test` makes one minimal request per provider and reports latency or the
 reason it failed:
@@ -909,6 +1161,13 @@ share one board over the network, run `openteam serve` and use §7.
 | `Source and managed branches diverged` | See the synchronisation trap in §7. `openteam sync` reports it; reconcile the mirror by hand. |
 | Merge reported as `failed` with no message | The mirror branch moved during the merge. Re-dispatch the task. |
 | `hermes exited with code 0` but the task shows `failed` | Expected. Hermes exits 0 on provider errors; the adapter detects them from the first output line. |
+| `antigravity: error: authentication required` | `agy` has no cached session. Run `agy` once interactively to sign in, or give it a Gemini key (`openteam keys set gemini`). |
+| `antigravity: error: invalid model selection` | The slug is not one `agy` knows. Run `agy models` and use a slug from that list. |
+| The agent did not run your tests and still reported success | A soft denial: `agy` could not ask for permission. Drop `--dangerously-skip-permissions` (see §5.6) and grant the commands in `~/.gemini/antigravity-cli/settings.json` instead. |
+| A change says `Reviewer abstain` and nothing merged | Deliberate. The reviewer would not commit to a verdict, so a human gets it. Check the reviewer's own key and reachability. |
+| `--reviewer x` is the same as `--provider x` | Refused on purpose: a model cannot usefully review its own work. Pick another provider. |
+| A fan-out says `Skipping the review` on one copy | That copy was written by the reviewer itself, so it stays for a human. The others were reviewed. |
+| `antigravity` shows as not installed but you have it | Set `ANTIGRAVITY_COMMAND` to its full path. The default is `agy`, which is not `antigravity`. |
 | Agent seems to hang | Runs are capped at 30 minutes. Hermes may also be waiting on an approval prompt; `--accept-hooks` is already passed. |
 | Ctrl-C left a task `running` | It should not: the client signals the agent's whole process group and settles the task. If you killed the process with `SIGKILL`, cancel it with `openteam cancel <id>`. |
 | Task stays `queued` | A dependency is not `completed`. Check `openteam show <id>`. |

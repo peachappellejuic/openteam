@@ -43,6 +43,9 @@ const ANSI = {
  */
 export class Screen {
   private entered = false;
+  /** Clears a half-read escape sequence when the screen goes away. */
+  private clearPending: (() => void) | undefined;
+  private pendingTimer: NodeJS.Timeout | undefined;
   private disposed = false;
 
   public constructor(
@@ -98,21 +101,54 @@ export class Screen {
     // decoder emits a bare "escape" for any chunk that ends mid-sequence, so a
     // fast burst of arrows (one read splitting "\u001b[B\u001b[B") is misread
     // as Escape and cancels whatever is on screen.
+    //
+    // Buffering has the opposite hazard: a real Escape press is a lone ESC
+    // byte, which looks identical to a truncated sequence until more data
+    // arrives. So a partial is carried for at most ESC_TIMEOUT_MS and then
+    // taken at face value.
     let pending = "";
-    const listener = (chunk: Buffer | string): void => {
-      pending += typeof chunk === "string" ? chunk : chunk.toString("utf8");
-      const rest = pending;
-      const keys = decodeKeys(rest);
-      const complete: Key[] = [];
-      for (const key of keys) {
-        if (isIncomplete(key)) {
-          // Keep the partial sequence for the next read.
-          pending = key.sequence;
-          continue;
-        }
-        complete.push(key);
+    let timer: NodeJS.Timeout | undefined;
+    this.clearPending = (): void => {
+      if (timer) clearTimeout(timer);
+      timer = undefined;
+      pending = "";
+    };
+
+    const flush = (): void => {
+      timer = undefined;
+      const buffer = pending;
+      pending = "";
+      if (!buffer) return;
+      if (buffer === "\u001b") {
+        handler({ sequence: "\u001b", name: "escape", ctrl: false, meta: false, shift: false });
+        return;
       }
-      for (const key of complete) handler(key);
+      for (const key of decodeKeys(buffer)) {
+        if (isIncomplete(key)) continue;
+        handler(key);
+      }
+    };
+
+    const listener = (chunk: Buffer | string): void => {
+      if (timer) {
+        clearTimeout(timer);
+        timer = undefined;
+      }
+      const buffer = pending + (typeof chunk === "string" ? chunk : chunk.toString("utf8"));
+      const keys = decodeKeys(buffer);
+      const last = keys[keys.length - 1];
+      // Only a trailing partial sequence is carried over; everything decoded is
+      // dispatched, and the consumed text is never replayed on the next read.
+      pending = last && isIncomplete(last) ? last.sequence : "";
+      for (const key of keys) {
+        if (isIncomplete(key)) continue;
+        handler(key);
+      }
+      if (pending) {
+        timer = setTimeout(flush, ESC_TIMEOUT_MS);
+        timer.unref?.();
+        this.pendingTimer = timer;
+      }
     };
     this.input.on("data", listener);
     return () => this.input.off("data", listener);
@@ -181,6 +217,13 @@ export const isTextKey = (key: Key): boolean =>
   !key.ctrl && !key.meta && key.sequence.length === 1 && key.sequence >= " ";
 
 const CSI_FINAL = /[\u0040-\u007e]/;
+
+/**
+ * How long a partial escape sequence waits for the rest before it is taken at
+ * face value. Long enough to span a split read, short enough that pressing
+ * Escape feels immediate.
+ */
+export const ESC_TIMEOUT_MS = 30;
 
 /** The keys `decodeKeys` produces, plus a marker for a partial sequence. */
 export type DecodedKey = Key | { name: "incomplete"; sequence: string };

@@ -1,7 +1,16 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
-import { clip, displayWidth, fit, isTextKey, promptCursor, wrap } from "../src/tui/screen.js";
+import {
+  clip,
+  decodeKeys,
+  displayWidth,
+  fit,
+  isIncomplete,
+  isTextKey,
+  promptCursor,
+  wrap,
+} from "../src/tui/screen.js";
 import {
   commandNames,
   detectCompletion,
@@ -422,4 +431,73 @@ test("the provider dropdown renders and fits like the command one", () => {
     assert.match(lines[0], /providers\s+3/);
   }
   assert.match(optionPalette([], 0, { columns: 40, rows: 10 }, "providers")[0].trim(), /no matching provider/);
+});
+
+// --- key decoding ------------------------------------------------------------
+// A read can end part-way through an escape sequence. Treating the fragment as a
+// finished key made a fast arrow burst cancel whatever was open, which is how
+// the provider menu used to close the instant you scrolled it.
+
+test("decodeKeys leaves a split escape sequence incomplete", () => {
+  const keys = decodeKeys("\u001b");
+  assert.equal(keys.length, 1);
+  assert.equal(isIncomplete(keys[0] as never), true);
+
+  const partial = decodeKeys("\u001b[");
+  assert.equal(isIncomplete(partial[partial.length - 1] as never), true);
+});
+
+test("decodeKeys reads a whole sequence as one arrow, not escape plus text", () => {
+  const keys = decodeKeys("\u001b[B").filter((key) => !isIncomplete(key as never));
+  assert.equal(keys.length, 1);
+  assert.equal((keys[0] as { name: string }).name, "down");
+});
+
+test("decodeKeys survives a burst of arrows split across reads", () => {
+  const names: string[] = [];
+  let pending = "";
+  for (const chunk of ["\u001b[B\u001b", "[B\u001b[B"]) {
+    const keys = decodeKeys(pending + chunk);
+    const last = keys[keys.length - 1];
+    pending = last && isIncomplete(last as never) ? (last as { sequence: string }).sequence : "";
+    for (const key of keys) {
+      if (isIncomplete(key as never)) continue;
+      names.push((key as { name: string }).name);
+    }
+  }
+  // Three arrows arrived. The trailing lone ESC is indistinguishable from a real
+  // Escape press and is deliberately left for the flush timer rather than being
+  // reported here; what matters is that no arrow was ever read as Escape, which
+  // is what used to close the open menu.
+  assert.equal(names.filter((name) => name === "down").length, 3);
+  assert.equal(names.includes("escape"), false);
+});
+
+test("decodeKeys maps control and function keys the app relies on", () => {
+  const name = (text: string): string =>
+    (decodeKeys(text).filter((key) => !isIncomplete(key as never))[0] as { name: string }).name;
+  assert.equal(name("\r"), "return");
+  assert.equal(name("\n"), "enter");
+  assert.equal(name("\t"), "tab");
+  assert.equal(name("\u007f"), "backspace");
+  assert.equal(isIncomplete(decodeKeys("\u001b")[0] as never), true); // resolved by the flush timer
+  const ctrlC = decodeKeys("\u0003")[0] as { name: string; ctrl: boolean };
+  assert.equal(ctrlC.name, "c");
+  assert.equal(ctrlC.ctrl, true);
+});
+
+test("decodeKeys reads modified arrows so ctrl-w is not swallowed as text", () => {
+  const shifted = decodeKeys("\u001b[1;2C")[0] as { name: string; shift: boolean };
+  assert.equal(shifted.name, "right");
+  assert.equal(shifted.shift, true);
+});
+
+test("decodeKeys never emits escape for an incomplete sequence", () => {
+  // The failure this guards: a fragment arriving alone must not act as Escape,
+  // which would cancel the open flow.
+  for (const fragment of ["\u001b", "\u001b[", "\u001bO", "\u001b[1;"]) {
+    for (const key of decodeKeys(fragment)) {
+      assert.notEqual((key as { name: string }).name, "escape", fragment);
+    }
+  }
 });

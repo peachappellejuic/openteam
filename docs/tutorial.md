@@ -314,11 +314,12 @@ Type `/` and the prompt opens a list of what you can do:
 
 ```
 › /d
-commands  3
+commands  4
 › /diff [change-id]    show a diff
   /cancel <task-id>    abort a running task
   /keys                provider keys and their free tiers
-1 command  •  ↑↓ choose  •  enter or tab to complete  •  esc to dismiss
+  /provider            set a key, or add a provider
+4 commands  •  ↑↓ choose  •  enter or tab to complete  •  esc to dismiss
 ```
 
 It narrows as you type, prefix matches first:
@@ -328,6 +329,11 @@ It narrows as you type, prefix matches first:
 | `/` | everything |
 | `/ap` | `/approve` |
 | `/k` | `/keys`, then `/tasks` |
+| `/provider` | runs it; an exact name does not wait for a second Enter |
+
+Type a command name in full and press `enter` once and it runs. Completing still
+works when you want a longer name: `/provider` offers `/providers` too, and arrowing
+down to it then pressing `enter` fills it in instead of running `/provider`.
 
 `↑` `↓` choose, `enter` or `tab` fill the command in, `esc` clears it. On a terminal
 too short to show the whole list it says how many are hidden rather than dropping them
@@ -340,7 +346,7 @@ list of agents opens, narrowed to what you have actually got:
 
 ```
 › fix the flaky test --provider
-providers  16  (6 not shown)
+providers  15  (5 not shown)
 › ollama     local, no key needed
   lmstudio   local, no key needed
   mock       agent cli
@@ -476,8 +482,42 @@ openteam providers        # what is installed, what has a key
 
 Two kinds:
 
-**Agent CLIs** do the work themselves: `codex`, `claude`, `opencode`, `hermes`, and
-`custom` for any command you point `AGENTSWARM_AGENT_COMMAND` at.
+**Agent CLIs** do the work themselves: `codex`, `claude`, `opencode`, `hermes`,
+`antigravity` (Google's, run as `agy`), and `custom` for any command you point
+`AGENTSWARM_AGENT_COMMAND` at.
+
+Try more than one at a time when you want competing answers to the same problem:
+
+```bash
+openteam "add caching to the user lookup" --provider all
+```
+
+```
+queued 5 tasks across codex, claude, opencode, hermes, antigravity
+review each diff and merge the one you want; merging two will conflict
+```
+
+Each agent keeps its own login, so all of them run at once — up to
+`AGENTSWARM_MAX_CONCURRENCY` (4). You get one diff per agent to compare, and you
+merge the one you want. `--provider codex,claude` narrows it to a chosen few, and in
+the TUI `--provider ` offers `all` as the first row.
+
+You can also have a second model review the work before it reaches you. It reads the
+diff and, if it approves, merges into the managed mirror — publishing still needs you:
+
+```bash
+openteam "add caching to the user lookup" --provider codex --reviewer claude
+```
+
+```
+review approve by claude (auto-approved)
+  the caching is keyed correctly and covered by a test
+merged 9e99fb5f29  AgentSwarm: add caching to the user lookup
+```
+
+It has to be a different provider from the one that wrote the change; asking `claude`
+to review `claude` is refused, because a model does not notice its own mistakes. A
+failing `--verify` is checked first and no reviewer can wave it through.
 
 **Direct API providers** skip the CLI — openteam speaks HTTP and runs the loop itself.
 Use these when no agent CLI is installed for a service, or when you want a local model.
@@ -517,6 +557,29 @@ ok  ollama      api   not required  http://127.0.0.1:11434  free and offline
 ```
 
 Keys are read from the environment first, then from `data/keys.json` at mode `0600`.
+
+In the TUI you do not have to leave for that. `/provider` opens a menu of every
+provider, and choosing one asks for its key without echoing it:
+
+```
+providers  15  (5 not shown)
+› ollama                 local
+  claude                 agent cli
+  openai needs a key     direct api
+  anthropic needs a key  direct api
+  5 more; keep typing to narrow
+15 entries  •  ↑↓ choose  •  enter to configure  •  esc to leave
+```
+
+Press `enter` on one that needs a key, paste it, and press `enter` again. It is
+stored at mode `0600` and then tested against that provider once, so you are told
+straight away whether it worked. The provider moves up into the usable group.
+
+The last row, `+ add a provider`, asks for an id, a wire format, a base url, the
+environment variable that will hold the key, and a default model — rejecting anything
+invalid as you go — and adds it to the list. A `127.0.0.1` or `localhost` url is
+assumed to be a local server, so no key is asked for; you can add one later from the
+same menu.
 Stored keys are also handed to agent CLIs, so `codex` finds `OPENAI_API_KEY` without a
 shell profile. They are deliberately *not* given to `--verify` commands.
 

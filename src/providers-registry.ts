@@ -25,7 +25,7 @@ interface ProviderFile {
 export class ProviderRegistry {
   private cache: { path: string; mtimeMs: number; entries: ApiProviderEntry[] } | undefined;
 
-  public constructor(public readonly filePath: string = join(config.dataDir, providerFileName)) {}
+  public constructor(public readonly filePath: string = registryPath ?? join(config.dataDir, providerFileName)) {}
 
   /** Every known provider, user definitions taking precedence. */
   public entries(): ApiProviderEntry[] {
@@ -103,7 +103,20 @@ export class ProviderRegistry {
   }
 }
 
+/**
+ * Where the registry reads from, when it has been pointed somewhere else.
+ *
+ * The data directory is fixed when config loads, so tests that need their own
+ * providers file set this rather than writing into the real one.
+ */
+let registryPath: string | undefined;
+
+/** Points the registry at another file. Tests use this. */
+export const setProviderRegistryPath = (filePath: string | undefined): void => {
+  registryPath = filePath;
+};
+
 /** The shared instance, pointed at the current data directory. */
-export const providerRegistry = (): ProviderRegistry => new ProviderRegistry();
+export const providerRegistry = (): ProviderRegistry => new ProviderRegistry(registryPath);
 
 export { API_PROVIDERS };

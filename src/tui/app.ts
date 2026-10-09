@@ -1,5 +1,21 @@
 import { config } from "../config.js";
-import { diffStat, fail, followTasks, resolveChange, resolveTask, say, titleFromPrompt, type Session } from "../cli/core.js";
+import { CLI_PROVIDER_IDS } from "../types.js";
+import {
+  agentIsAvailable,
+  diffStat,
+  fail,
+  fanoutCaveats,
+  followTasks,
+  PROVIDER_ALL,
+  queueSummary,
+  resolveChange,
+  resolveTask,
+  say,
+  splitList,
+  submitInstruction,
+  titleFromPrompt,
+  type Session,
+} from "../cli/core.js";
 import { providerRegistry } from "../providers-registry.js";
 import { isLoopbackUrl } from "../api/registry.js";
 import { knownProviderIds } from "../providers.js";
@@ -83,9 +99,22 @@ interface State {
   options: () => PromptOption[];
   /** Set while a multi-step flow owns the keyboard, such as `/provider`. */
   wizard?: WizardStep;
+  /**
+   * True once a provider value has been chosen.
+   *
+   * The line still ends in `--provider <value> `, so the dropdown would otherwise
+   * open again on the trailing space and the next Enter would complete a second
+   * value into it instead of running the task.
+   */
+  completionDismissed: boolean;
 }
 
 const PANE_TASKS: Pane = "tasks";
+
+/** Agent ids `--provider all` fans out to: the CLIs, not the mock or `custom`. */
+const FANOUT_AGENTS: ReadonlySet<string> = new Set(
+  CLI_PROVIDER_IDS.filter((id) => id !== "mock" && id !== "custom"),
+);
 
 export const runTui = async (session: Session, args: ParsedArgs): Promise<number> => {
   const screen = new Screen();
@@ -126,6 +155,7 @@ export const runTui = async (session: Session, args: ParsedArgs): Promise<number
     completionIndex: 0,
     completion: () => undefined,
     options: () => [],
+    completionDismissed: false,
   };
 
   const provider = flagString(args, "provider");
@@ -167,6 +197,18 @@ export const runTui = async (session: Session, args: ParsedArgs): Promise<number
     });
   };
 
+  /**
+   * True when the provider value already typed names a real option.
+   *
+   * `--provider claude` is a finished instruction; completing it again would
+   * just append a space. `--provider cla` is not, and must still complete.
+   */
+  const exactProvider = (): boolean => {
+    const request = state.completion();
+    if (request?.kind !== "provider" || !request.query) return false;
+    return state.options().some((option) => option.value === request.query);
+  };
+
   const completionHint = (request: CompletionRequest | undefined, matches: PromptOption[]): string => {
     if (!request) return "";
     const noun = request.kind === "command" ? "command" : "provider";
@@ -189,14 +231,29 @@ export const runTui = async (session: Session, args: ParsedArgs): Promise<number
   const refreshProviders = async (force = false): Promise<void> => {
     if (!force && providerCache && Date.now() - providerCache.at < PROVIDER_CACHE_MS) return;
     const listed = await session.orchestrator.getProviders();
+    // `all` is not a provider, it is an instruction to use several at once, so it
+    // is offered here rather than coming from the registry.
+    const agents = listed.filter((provider) => FANOUT_AGENTS.has(provider.id) && provider.available);
     providerCache = {
       at: Date.now(),
-      options: listed.map((provider) => ({
-        value: provider.id,
-        usage: provider.available ? "" : "not available",
-        summary: provider.available ? describeProvider(provider.id) : "set a key or install it",
-        usable: provider.available,
-      })),
+      options: [
+        ...(agents.length > 1
+          ? [
+              {
+                value: PROVIDER_ALL,
+                usage: `${agents.length} agents`,
+                summary: "one task each, in parallel",
+                usable: true,
+              },
+            ]
+          : []),
+        ...listed.map((provider) => ({
+          value: provider.id,
+          usage: provider.available ? "" : "not available",
+          summary: provider.available ? describeProvider(provider.id) : "set a key or install it",
+          usable: provider.available,
+        })),
+      ],
     };
     dirty = true;
   };
@@ -222,6 +279,19 @@ export const runTui = async (session: Session, args: ParsedArgs): Promise<number
 
   const menuOptions = (): PromptOption[] => providerMenuOptions(providerSummaries());
 
+  /**
+   * Reopens the menu with a given provider highlighted.
+   *
+   * Without this the selection sits at the top of the list, so pressing Enter
+   * again after configuring one provider opens an unrelated one's credential.
+   */
+  const focusProvider = (id: string): void => {
+    openWizard({ kind: "providerMenu" });
+    const index = menuOptions().findIndex((option) => option.value === id);
+    state.completionIndex = index >= 0 ? index : 0;
+    dirty = true;
+  };
+
   const wireHelp = (wire: string): string =>
     wire === "openai"
       ? "OpenAI-compatible chat completions"
@@ -233,6 +303,9 @@ export const runTui = async (session: Session, args: ParsedArgs): Promise<number
     state.wizard = step;
     state.input = "";
     state.completionIndex = 0;
+    // A complaint about the previous step is stale once that step is behind us;
+    // leaving it up reads as though the new field were also rejected.
+    if (step.kind !== "credential") state.message = "";
     dirty = true;
   };
 
@@ -273,7 +346,7 @@ export const runTui = async (session: Session, args: ParsedArgs): Promise<number
       detail += " (not attached to a provider yet)";
     }
 
-    openWizard({ kind: "providerMenu" });
+    focusProvider(entry?.id ?? "");
     note(detail, kind);
   };
 
@@ -296,18 +369,21 @@ export const runTui = async (session: Session, args: ParsedArgs): Promise<number
 
     await refreshProviders(true);
     if (!draft.requiresKey || !key.trim()) {
-      openWizard({ kind: "providerMenu" });
-      note(`added ${bold(saved.id)} — no key needed`, "info");
+      focusProvider(saved.id);
+      note(
+        `added ${bold(saved.id)}${draft.requiresKey ? " — no key entered; add one any time" : " — no key needed"}`,
+        "info",
+      );
       return;
     }
     try {
       session.secrets.set(draft.envName!, key.trim());
     } catch (error) {
-      openWizard({ kind: "providerMenu" });
+      focusProvider(saved.id);
       note(`added ${saved.id}, but ${error instanceof Error ? error.message : "the key was not stored"}`, "error");
       return;
     }
-    openWizard({ kind: "providerMenu" });
+    focusProvider(saved.id);
     note(`added ${bold(saved.id)} — key stored, run \`openteam keys test ${saved.id}\` to confirm`, "info");
   };
 
@@ -316,7 +392,9 @@ export const runTui = async (session: Session, args: ParsedArgs): Promise<number
     let next = applyField(draft, field, value);
     if (field === "id") next = { ...next, envName: next.envName ?? suggestEnvName(value) };
 
-    if (field === "id" && isLoopbackUrl(value)) next = { ...next, requiresKey: false };
+    // A server on this machine usually has no credential, so do not ask for one;
+    // the user can still add it later through this same menu.
+    if (field === "url" && isLoopbackUrl(value)) next = { ...next, requiresKey: false };
 
     const following = nextField(next, field);
     if (following === "wire") {
@@ -324,6 +402,12 @@ export const runTui = async (session: Session, args: ParsedArgs): Promise<number
       return;
     }
     if (!following) {
+      // Nothing left to ask. With no key required the provider is done, so do
+      // not leave the user on a prompt that would store nothing.
+      if (!next.requiresKey) {
+        launch(() => addProviderFromDraft(next, ""));
+        return;
+      }
       openWizard({ kind: "addKey", draft: next, value: "", message: "" });
       return;
     }
@@ -331,7 +415,9 @@ export const runTui = async (session: Session, args: ParsedArgs): Promise<number
   };
 
   state.completion = (): CompletionRequest | undefined =>
-    state.detail || wizardActive(state.wizard) ? undefined : detectCompletion(state.input);
+    state.detail || state.completionDismissed || wizardActive(state.wizard)
+      ? undefined
+      : detectCompletion(state.input);
 
   state.options = (): PromptOption[] => {
     const request = state.completion();
@@ -585,6 +671,9 @@ export const runTui = async (session: Session, args: ParsedArgs): Promise<number
     }
     state.input = `${request.keep}${chosen.value} `;
     state.completionIndex = 0;
+    // A command name is finished by its trailing space, but a provider flag is
+    // still there to be detected again, so the dropdown is dismissed explicitly.
+    state.completionDismissed = request.kind === "provider";
   };
 
   const submit = async (): Promise<void> => {
@@ -592,6 +681,7 @@ export const runTui = async (session: Session, args: ParsedArgs): Promise<number
     state.input = "";
     if (!text) return;
 
+    state.completionDismissed = false;
     if (text.startsWith("/")) return slash(text);
     if (!project) {
       note("no project connected", "error");
@@ -601,17 +691,26 @@ export const runTui = async (session: Session, args: ParsedArgs): Promise<number
 
     try {
       const parsed = parseArgs(tokenize(text));
-      const task = await session.orchestrator.createTask(project.id, {
-        title: flagString(parsed, "title") ?? titleFromPrompt(text),
-        description: text,
-        provider: flagString(parsed, "provider") as Task["provider"],
+      const input = {
+        // The prompt without its flags, so a task titled "add caching" does not
+        // become "add caching --provider all" once the fan-out suffix is added.
+        title: flagString(parsed, "title") ?? titleFromPrompt(parsed.prompt),
+        description: parsed.prompt,
+        // Validated here rather than cast: the flag accepts a list or `all`, and
+        // an unknown id should say so now instead of at the first tool call.
+        provider: flagString(parsed, "provider"),
         model: flagString(parsed, "model"),
+        reviewer: flagString(parsed, "reviewer"),
+        reviewModel: flagString(parsed, "review-model"),
         assignee: flagString(parsed, "assignee"),
-        allowedPaths: (flagString(parsed, "paths") ?? "").split(",").map((item) => item.trim()).filter(Boolean),
-      });
+        allowedPaths: splitList(flagString(parsed, "paths")),
+        acceptanceTests: [] as string[],
+      };
+      const tasks = await submitInstruction(session, project.id, input, agentIsAvailable);
       state.pane = PANE_TASKS;
       state.selected = 0;
-      note(`queued ${task.id}`);
+      const warnings = fanoutCaveats(tasks, input);
+      note(warnings.length ? `${queueSummary(tasks)}  ·  ${warnings[0]}` : queueSummary(tasks));
       dirty = true;
     } catch (error) {
       note(error instanceof Error ? error.message : "could not queue that", "error");
@@ -928,6 +1027,7 @@ export const runTui = async (session: Session, args: ParsedArgs): Promise<number
       if (state.completion() !== undefined) {
         // Dismiss without losing the rest of what was typed.
         state.input = "";
+        state.completionDismissed = false;
         dirty = true;
         return;
       }
@@ -937,20 +1037,15 @@ export const runTui = async (session: Session, args: ParsedArgs): Promise<number
       return;
     }
     if (key.name === "return" || key.name === "enter") {
-      // Enter completes a palette choice rather than running it, so a
-      // half-typed command never fires with the wrong argument. The one
-      // exception: the highlighted row already is the name that was typed, so
-      // completing would only add a space and demand a second Enter. Arrowing
-      // to a longer name still completes normally.
+      // Enter completes a palette choice rather than running it, so a half-typed
+      // name never fires with the wrong argument. The exception is a value that
+      // is already exact: completing it would only add a space and then demand a
+      // second Enter. Arrowing to a longer name still completes as usual.
       const named = exactCommand(state.input);
-      if (state.completion() !== undefined && state.options().length) {
-        // Option values keep the leading slash; exactCommand does not.
-        const highlighted = state.options()[state.completionIndex]?.value.replace(/^\//, "");
-        if (!named || highlighted !== named) {
-          completeFromPalette();
-          dirty = true;
-          return;
-        }
+      if (state.completion() !== undefined && state.options().length && !exactProvider()) {
+        completeFromPalette();
+        dirty = true;
+        return;
       }
       if (state.detail && state.selected >= 0) {
         launch(runSelected);
@@ -968,16 +1063,19 @@ export const runTui = async (session: Session, args: ParsedArgs): Promise<number
     if (key.name === "backspace") {
       state.input = state.input.slice(0, -1);
       state.completionIndex = 0;
+      state.completionDismissed = false;
       dirty = true;
       return;
     }
     if (key.ctrl && key.name === "u") {
       state.input = "";
+      state.completionDismissed = false;
       dirty = true;
       return;
     }
     if (key.ctrl && key.name === "w") {
       state.input = state.input.replace(/\S+\s*$/, "");
+      state.completionDismissed = false;
       dirty = true;
       return;
     }
@@ -992,6 +1090,8 @@ export const runTui = async (session: Session, args: ParsedArgs): Promise<number
     if (isTextKey(key)) {
       state.input += key.sequence;
       state.completionIndex = 0;
+      // Typing after a choice means the value is being edited, not accepted.
+      state.completionDismissed = false;
       if (detectCompletion(state.input)?.kind === "provider") {
         void refreshProviders().catch(() => undefined);
       }

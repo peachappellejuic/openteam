@@ -25,11 +25,16 @@ import {
   emit,
   fail,
   followTasks,
+  agentIsAvailable,
+  fanoutCaveats,
   note,
   parseProviderId,
+  queueSummary,
   resolveChange,
   resolveTask,
+  submitInstruction,
   titleFromPrompt,
+  validateProviderValue,
   type Session,
 } from "./cli/core.js";
 import {
@@ -130,6 +135,14 @@ interface RunOptions {
  * Follows tasks to completion and reports each outcome.
  * Tasks that land in review print their diff so the work can be judged in the terminal.
  */
+/** How a change stands right now, so nothing is described as pending once merged. */
+const changeStatusLabel = (change: Change): string => {
+  if (change.status === "merged") return green(`merged ${shortSha(change.mergedSha ?? "")}`);
+  if (change.status === "approved") return yellow("approved, ready to merge");
+  if (change.status === "conflict") return red(`conflict  ${change.error ?? ""}`.trimEnd());
+  return yellow("review");
+};
+
 const runTasks = async (session: Session, tasks: Task[], options: RunOptions): Promise<number> => {
   // A plan step is only unblocked once its dependency has been merged, so the
   // chain stops following at the first step that needs a human decision.
@@ -148,14 +161,21 @@ const runTasks = async (session: Session, tasks: Task[], options: RunOptions): P
   let exitCode = EXIT_OK;
 
   for (const task of finalTasks) {
-    const change = task.status === "review" ? changeForTask(session, task) : undefined;
+    // Looked up by task, not by status: merging completes the task, so a change
+    // that has already been merged would otherwise be reported as "no changes".
+    const change = changeForTask(session, task);
     emit(session, { task, change: change ?? null }, () => {
       const lines = [`${bold(task.title)}  ${dim(task.id)}`];
       if (change) {
         const stat = diffStat(change.diff);
-        lines.push(`${yellow("review")}  ${change.summary}`);
+        lines.push(`${changeStatusLabel(change)}  ${change.summary}`);
         lines.push(`${dim("branch")} ${change.branch}  ${dim(`${shortSha(change.baseSha)} → ${shortSha(change.commitSha)}`)}`);
         lines.push(`${dim("files")} ${count(stat.files.length, "file")}  ${green(`+${stat.added}`)} ${red(`-${stat.removed}`)}`);
+        if (change.review) {
+          const who = `${change.review.provider}${change.review.model ? `/${change.review.model}` : ""}`;
+          lines.push(`${dim("review")} ${change.review.verdict} by ${who}${change.review.autoApproved ? " (auto-approved)" : ""}`);
+          for (const reason of change.review.reasons) lines.push(dim(`  ${reason}`));
+        }
       } else if (task.status === "completed") {
         lines.push(`${green("done")}  the agent reported no file changes`);
       } else if (task.status === "failed") {
@@ -173,7 +193,15 @@ const runTasks = async (session: Session, tasks: Task[], options: RunOptions): P
       const project = session.store.getProject(task.projectId);
       if (project && !session.json) {
         await page(colorizeDiff(`\n${diffHeader(change, project)}\n\n${change.diff}`));
-        note(session, `next  openteam approve ${change.id} && openteam merge ${change.id}`);
+        // Only suggest a merge that has not happened: an auto-approved change is
+        // already in the mirror by the time anyone reads this.
+        if (change.status === "pending") {
+          note(session, `next  openteam approve ${change.id} && openteam merge ${change.id}`);
+        } else if (change.status === "approved") {
+          note(session, `next  openteam merge ${change.id}`);
+        } else if (change.status === "merged") {
+          note(session, `merged as ${shortSha(change.mergedSha ?? "")}  \u00b7  publish with: openteam push`);
+        }
       }
     }
   }
@@ -231,13 +259,14 @@ const reportDeferrals = (session: Session, tasks: Task[]): void => {
   }
 };
 
-const parseProvider = (args: ParsedArgs): ProviderId | undefined => parseProviderId(flagString(args, "provider"));
 
 const taskInput = (args: ParsedArgs, prompt: string) => ({
   title: flagString(args, "title") ?? titleFromPrompt(prompt),
   description: prompt,
-  provider: parseProvider(args),
+  provider: flagString(args, "provider"),
   model: flagString(args, "model"),
+  reviewer: flagString(args, "reviewer"),
+  reviewModel: flagString(args, "review-model"),
   assignee: flagString(args, "assignee"),
   dependencies: flagList(args, "depends"),
   allowedPaths: flagList(args, "paths"),
@@ -251,14 +280,22 @@ const oneShot = async (session: Session, args: ParsedArgs, prompt: string, signa
   // Without follow-up there is nothing to supervise, so the task stays queued
   // for `openteam run` or `openteam watch` instead of starting and being cancelled.
   const detach = flagBool(args, "no-follow");
-  const task = await session.orchestrator.createTask(project.id, taskInput(args, prompt), { dispatch: !detach });
-  note(session, `queued ${task.id}`);
+  const tasks = await submitInstruction(session, project.id, taskInput(args, prompt), agentIsAvailable, {
+    dispatch: !detach,
+  });
+  note(session, queueSummary(tasks));
+  for (const warning of fanoutCaveats(tasks, taskInput(args, prompt))) note(session, warning);
   if (detach) {
-    emit(session, { task }, () => `${task.id}  ${task.title}`);
-    note(session, `start it later with: openteam run ${task.id}`);
+    emit(session, { tasks }, () => tasks.map((task) => `${task.id}  ${task.title}`).join("\n"));
+    note(
+      session,
+      tasks.length === 1
+        ? `start it later with: openteam run ${tasks[0]!.id}`
+        : `start them later with: openteam watch   (or one at a time: openteam run ${tasks[0]!.id})`,
+    );
     return EXIT_OK;
   }
-  return runTasks(session, [task], { showDiff: true, signal });
+  return runTasks(session, tasks, { showDiff: true, signal });
 };
 
 /** Queued, blocked, or already running work that a merge has just unblocked. */
@@ -574,7 +611,7 @@ const keysCommand = async (session: Session, args: ParsedArgs, rest: string[]): 
       missing.length
         ? dim(`${missing.length} provider${missing.length === 1 ? "" : "s"} still need a key`)
         : dim("every provider that needs a key has one"),
-      dim(`stored in ${store.filePath}; keys are also passed to agent CLIs (codex, claude, opencode, hermes)`),
+      dim(`stored in ${store.filePath}; keys are also passed to agent CLIs (codex, claude, opencode, hermes, antigravity)`),
     ].join("\n");
   });
   return EXIT_OK;
@@ -709,8 +746,10 @@ const commands: Record<string, CommandHandler> = {
     const tasks = await session.orchestrator.createPlan(project.id, {
       goal,
       tasks: supplied,
-      provider: parseProvider(args),
+      provider: parseProviderId(flagString(args, "provider")),
       model: flagString(args, "model"),
+      reviewer: parseProviderId(flagString(args, "reviewer")),
+      reviewModel: flagString(args, "review-model"),
       assignee: flagString(args, "assignee"),
       allowedPaths: flagList(args, "paths"),
       verifyCommand: flagString(args, "verify"),
@@ -972,7 +1011,7 @@ export const run = async (argv: string[] = process.argv.slice(2)): Promise<numbe
 
   setColor(!flagBool(args, "no-color") && colorEnabledForStream(process.stdout));
   try {
-    parseProvider(args);
+    validateProviderValue(flagString(args, "provider"));
     flagNumber(args, "limit", 50);
   } catch (error) {
     process.stderr.write(`${red("error")} ${error instanceof Error ? error.message : "bad arguments"}\n`);

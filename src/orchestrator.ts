@@ -19,6 +19,9 @@ import {
 } from "./git.js";
 import { newId, now } from "./ids.js";
 import { ensureProviderAvailable, getAdapter, knownProviderIds, listProviders } from "./providers.js";
+import { apiClientFor, isCliReviewer, runCliPrompt, secretStore } from "./providers.js";
+import { providerRegistry } from "./providers-registry.js";
+import { buildReviewPrompt, parseVerdict, reviewDiff, type Review } from "./api/reviewer.js";
 import type { JsonStore } from "./store.js";
 import type {
   AppEvent,
@@ -203,6 +206,8 @@ export class Orchestrator {
       allowedPaths: [...new Set(input.allowedPaths ?? [])],
       acceptanceTests: [...new Set(input.acceptanceTests ?? [])],
       verifyCommand: input.verifyCommand?.trim() || undefined,
+      reviewer: input.reviewer?.trim() || undefined,
+      reviewModel: input.reviewModel?.trim() || undefined,
       branch: `agentswarm/task/${id}`,
       createdAt: timestamp,
       updatedAt: timestamp,
@@ -258,6 +263,8 @@ export class Orchestrator {
         parentId: planId,
         provider: template.provider ?? input.provider,
         model: input.model,
+        reviewer: template.reviewer ?? input.reviewer,
+        reviewModel: input.reviewModel,
         assignee: template.assignee ?? input.assignee,
         allowedPaths: template.allowedPaths ?? input.allowedPaths,
         verifyCommand: template.verifyCommand ?? input.verifyCommand,
@@ -625,10 +632,57 @@ export class Orchestrator {
           createdAt: now(),
           updatedAt: now(),
         };
-        await this.store.createChange(change);
-        await this.store.updateTask(task.id, { status: "review", result: truncate(result.output, 4000) });
+        // The reviewer only ever sees a change that already passed --verify and
+        // --paths, both of which are hard stops above. No verdict can undo them.
+        const review = await this.reviewChange(change, task, project.id);
+        await this.store.createChange(review ? { ...change, review } : change);
+        await this.event({
+          projectId: project.id,
+          taskId: task.id,
+          runId,
+          changeId: change.id,
+          type: "task.review",
+          message: review
+            ? `${review.verdict === "approve" ? "Reviewed and approved" : `Reviewer ${review.verdict}`}: ${review.reasons.join("; ") || "no reason given"}`
+            : `Change ready for review: ${summary}`,
+        });
+
+        // Approving from a second model's verdict merges into the managed mirror
+        // only. Publishing stays a human step, so nothing reaches a branch you
+        // work on without you running `openteam push`.
+        //
+        // This happens before the task is marked "review" on purpose: followers
+        // are released by that update, and telling someone to merge a change
+        // that has already merged is worse than waiting a moment longer.
+        if (review?.verdict === "approve" && review.completed) {
+          try {
+            await this.approveChange(change.id);
+            await this.store.updateChange(change.id, { review: { ...review, autoApproved: true } });
+            await this.mergeChange(change.id);
+          } catch (error) {
+            // The work is done and reviewable; a failed auto-merge is a queue
+            // problem, not a task failure, so it must not discard the change.
+            await this.event({
+              projectId: project.id,
+              taskId: task.id,
+              changeId: change.id,
+              type: "merge.deferred",
+              message: `Approved by ${review.provider}, but the automatic merge failed: ${
+                error instanceof Error ? error.message : "unknown error"
+              }. Merge it with \`openteam merge ${change.id}\`.`,
+            });
+          }
+        }
+
+        // A merged change completes its task; anything else waits in the queue.
+        // Set after the auto-merge above, so the two cannot disagree.
+        const settled = this.store.getChange(change.id);
+        const mergedNow = settled?.status === "merged";
+        await this.store.updateTask(task.id, {
+          status: mergedNow ? "completed" : "review",
+          result: mergedNow ? `Merged as ${settled?.mergedSha ?? ""}` : truncate(result.output, 4000),
+        });
         await this.store.updateRun(runId, { status: "completed", exitCode: result.exitCode, finishedAt: now() });
-        await this.event({ projectId: project.id, taskId: task.id, runId, changeId: change.id, type: "task.review", message: `Change ready for review: ${summary}` });
       }
     } catch (error) {
       if (startedTask) {
@@ -647,6 +701,92 @@ export class Orchestrator {
       this.deferred.delete(task.id);
       if (project) this.dispatchInBackground(project.id);
     }
+  }
+
+  /**
+   * Asks a second model to judge the diff.
+   *
+   * Returns undefined when no reviewer was asked for, or when one was but cannot
+   * be run — in which case the change goes to the human queue untouched rather
+   * than being approved by default.
+   */
+  private async reviewChange(change: Change, task: Task, projectId: string): Promise<Review | undefined> {
+    if (!task.reviewer) return undefined;
+
+    const describe = (extra: string): Promise<void> =>
+      this.event({ projectId, taskId: task.id, changeId: change.id, type: "review.skipped", message: extra });
+
+    if (task.reviewer === task.provider) {
+      // Self-review is not review: the same model that wrote the change repeats
+      // its own mistakes, which are exactly the ones it will not notice.
+      await describe(
+        `Skipping the review: ${task.reviewer} wrote this change, so it cannot also review it. Choose a different --reviewer.`,
+      );
+      return {
+        verdict: "abstain",
+        reasons: ["reviewer is the same provider that wrote the change"],
+        provider: task.reviewer,
+        completed: false,
+        error: "the reviewer must differ from the provider that wrote the change",
+      };
+    }
+
+    const meta = { provider: task.reviewer, model: task.reviewModel };
+    const entry = providerRegistry().get(task.reviewer);
+
+    if (!entry) {
+      // An agent CLI can review too, which matters because that is how most
+      // people are signed in; it is the agent's own login that is used.
+      if (!isCliReviewer(task.reviewer)) {
+        await describe(`Skipping the review: --reviewer ${task.reviewer} is neither an endpoint nor an installed agent CLI.`);
+        return {
+          verdict: "abstain",
+          reasons: [],
+          ...meta,
+          completed: false,
+          error: `${task.reviewer} is not an endpoint or an installed agent`,
+        };
+      }
+      try {
+        const answer = await runCliPrompt(task.reviewer, buildReviewPrompt({ task, diff: change.diff }), {
+          cwd: this.projectPath(projectId),
+        });
+        const parsed = parseVerdict(answer.stdout);
+        if (parsed.verdict === "abstain" && !parsed.reasons.length) {
+          return {
+            verdict: "abstain",
+            reasons: [],
+            ...meta,
+            completed: false,
+            error: `${task.reviewer} did not return a verdict`,
+          };
+        }
+        return { ...parsed, ...meta, completed: true };
+      } catch (error) {
+        await describe(`Skipping the review: ${task.reviewer} could not be run: ${error instanceof Error ? error.message : "unknown error"}`);
+        return {
+          verdict: "abstain",
+          reasons: [],
+          ...meta,
+          completed: false,
+          error: error instanceof Error ? error.message : "the reviewer could not be run",
+        };
+      }
+    }
+
+    if (entry.requiresKey && !secretStore().getAny(entry.envNames)) {
+      await describe(
+        `Skipping the review: ${task.reviewer} has no key. Set one with \`openteam keys set ${task.reviewer}\`.`,
+      );
+      return { verdict: "abstain", reasons: [], ...meta, completed: false, error: `no key for ${task.reviewer}` };
+    }
+
+    return reviewDiff(apiClientFor(entry, task.reviewModel), { task, diff: change.diff }, meta);
+  }
+
+  /** The managed repository, which is where a reviewer may read. */
+  private projectPath(projectId: string): string {
+    return this.requireProject(projectId).managedRepositoryPath;
   }
 
   private async failTask(task: Task, error: unknown, runId = task.runId): Promise<void> {

@@ -97,22 +97,26 @@ export const waitForTasks = async (
 
   return new Promise<Map<string, Task>>((resolve) => {
     let unsubscribe: () => void = () => {};
-    let settle = (): void => {};
-    const timer = setInterval(collect, 750);
+    let timer: NodeJS.Timeout | undefined;
+    let finished = false;
     const finish = (): void => {
+      if (finished) return;
+      finished = true;
       unsubscribe();
-      clearInterval(timer);
+      if (timer) clearInterval(timer);
       options.signal?.removeEventListener("abort", onAbort);
       resolve(done);
     };
     const check = (): void => {
       collect();
-      if (done.size >= watched.size) settle();
+      // The poll has to be able to finish the wait by itself. It used to call
+      // collect() only, so a task that settled without emitting an event
+      // afterwards was followed forever: nothing arrived to trigger the check.
+      if (done.size >= watched.size) finish();
     };
+    timer = setInterval(check, 750);
     const onAbort = (): void => {
-      clearInterval(timer);
-      unsubscribe();
-      resolve(done);
+      finish();
     };
     unsubscribe = store.subscribe((event) => {
       if (options.onEvent && (!event.taskId || watched.has(event.taskId) || event.type.startsWith("project."))) {
@@ -120,7 +124,6 @@ export const waitForTasks = async (
       }
       check();
     });
-    settle = finish;
     if (options.signal?.aborted) onAbort();
     else options.signal?.addEventListener("abort", onAbort, { once: true });
   });

@@ -5,7 +5,7 @@
  * user has added with `openteam provider add`, so the id cannot be a literal
  * union at the type level.
  */
-export const CLI_PROVIDER_IDS = ["mock", "codex", "claude", "opencode", "hermes", "custom"] as const;
+export const CLI_PROVIDER_IDS = ["mock", "codex", "claude", "opencode", "hermes", "antigravity", "custom"] as const;
 
 export const CLI_PROVIDER_SET: ReadonlySet<string> = new Set(CLI_PROVIDER_IDS);
 
@@ -50,6 +50,9 @@ export interface Task {
   allowedPaths: string[];
   acceptanceTests: string[];
   verifyCommand?: string;
+  /** A second opinion on the diff before it reaches the review queue. */
+  reviewer?: ProviderId;
+  reviewModel?: string;
   createdAt: string;
   updatedAt: string;
   startedAt?: string;
@@ -85,6 +88,18 @@ export interface Change {
   updatedAt: string;
   mergedSha?: string;
   error?: string;
+  /** The reviewer's verdict, when one was asked for. */
+  review?: {
+    verdict: "approve" | "request-changes" | "abstain";
+    reasons: string[];
+    provider: string;
+    model?: string;
+    /** False when the reviewer could not be run at all. */
+    completed: boolean;
+    /** True when this verdict is what approved the change, with no human involved. */
+    autoApproved?: boolean;
+    error?: string;
+  };
 }
 
 export interface AppEvent {
@@ -122,13 +137,24 @@ export interface CreateTaskInput {
   allowedPaths?: string[];
   acceptanceTests?: string[];
   verifyCommand?: string;
+  /** A second opinion on the diff; must differ from `provider`. */
+  reviewer?: ProviderId;
+  reviewModel?: string;
   parentId?: string;
 }
 
 /** One step of a plan. `dependsOn` holds indices into the same array. */
 export type PlanTaskInput = Pick<
   CreateTaskInput,
-  "title" | "description" | "assignee" | "provider" | "allowedPaths" | "acceptanceTests" | "verifyCommand"
+  | "title"
+  | "description"
+  | "assignee"
+  | "provider"
+  | "allowedPaths"
+  | "acceptanceTests"
+  | "verifyCommand"
+  | "reviewer"
+  | "reviewModel"
 > & {
   dependencies?: string[];
   /** Zero-based indices of earlier tasks that must finish first. */
@@ -141,6 +167,8 @@ export interface PlanInput {
   /** Used for generated steps that do not name their own provider. */
   provider?: ProviderId;
   model?: string;
+  reviewer?: ProviderId;
+  reviewModel?: string;
   allowedPaths?: string[];
   verifyCommand?: string;
   assignee?: string;

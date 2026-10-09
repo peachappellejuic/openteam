@@ -2,6 +2,8 @@ export const VALUE_FLAGS = [
   "project",
   "provider",
   "model",
+  "reviewer",
+  "review-model",
   "assignee",
   "paths",
   "verify",

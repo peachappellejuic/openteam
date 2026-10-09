@@ -230,7 +230,7 @@ export const validateUserProvider = (input: unknown): UserProviderInput => {
 };
 
 /** Ids that belong to agent CLIs, which cannot be redefined as API providers. */
-export const CLI_PROVIDER_NAMES = new Set(["mock", "codex", "claude", "opencode", "hermes", "custom"]);
+export const CLI_PROVIDER_NAMES = new Set(["mock", "codex", "claude", "opencode", "hermes", "antigravity", "custom"]);
 
 /** True when the endpoint is on this machine, so repository content stays local. */
 export const isLoopbackUrl = (baseUrl: string): boolean => {

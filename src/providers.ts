@@ -114,7 +114,10 @@ const runProcess = async (
     child.on("error", (error) => finish(() => reject(error)));
     child.on("close", (exitCode) => {
       const result = { output, exitCode: exitCode ?? 1 };
-      const reported = result.exitCode === 0 ? detectFailure?.(result.output) : undefined;
+      // Checked even on a non-zero exit: a CLI that explains its failure is more
+      // use than "exited with code 1", and Antigravity reports the reason (a bad
+      // --model, for one) in the same envelope it exits with.
+      const reported = detectFailure?.(result.output);
       finish(() => {
         if (reported) reject(new Error(reported));
         else if (result.exitCode === 0) resolve(result);
@@ -128,6 +131,14 @@ interface CommandAdapterOptions {
   promptFirst?: boolean;
   extraArgs?: string[];
   detectFailure?: (output: string) => string | undefined;
+  /**
+   * Treat any successful spawn as installed, whatever the exit code.
+   *
+   * Antigravity's documented flags do not include `--version`, and a client that
+   * rejects an unknown flag would otherwise look absent on every machine where it
+   * is in fact installed. Only a spawn failure counts as missing.
+   */
+  looseProbe?: boolean;
 }
 
 export const buildProviderArgs = (
@@ -167,7 +178,7 @@ const commandAdapter = (
         finish(false);
       }, 2_000);
       probe.once("error", () => finish(false));
-      probe.once("close", (code) => finish(code === 0));
+      probe.once("close", (code) => finish(options.looseProbe ? true : code === 0));
     });
   },
   run: (context) => {
@@ -186,6 +197,53 @@ export const hermesFailure = (output: string): string | undefined => {
   if (/^API call failed after \d+ retries:/i.test(firstLine)) return firstLine;
   if (/^hermes\b.*\bagent failed:/i.test(firstLine)) return firstLine;
   return undefined;
+};
+
+/**
+ * Antigravity reports a terminal status in its JSON stream, and that is the only
+ * place a failure is described: the run keeps going after a soft denial and can
+ * still exit 0 having done less than it was asked. Reading `status` from the
+ * final event turns that into a real failure the orchestrator can see.
+ *
+ * Only lines that parse as a whole JSON object are considered, so agent prose
+ * that happens to mention ERROR, or a diff containing braces, cannot be mistaken
+ * for one. Both shapes are handled because AGENTSWARM_ANTIGRAVITY_ARGS can
+ * switch the output format away from the default.
+ */
+export const antigravityFailure = (output: string): string | undefined => {
+  let result: Record<string, unknown> | undefined;
+  for (const line of output.split("\n")) {
+    const trimmed = line.trim();
+    if (!trimmed.startsWith("{")) continue;
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(trimmed);
+    } catch {
+      continue;
+    }
+    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) continue;
+    const record = parsed as Record<string, unknown>;
+    // stream-json wraps the terminal state in a result event; the plain json
+    // envelope puts it at the top level.
+    const candidate =
+      record.event === "result" && record.result && typeof record.result === "object"
+        ? (record.result as Record<string, unknown>)
+        : record;
+    if (typeof candidate.status === "string") result = candidate;
+  }
+
+  // An unauthenticated headless run says so on stderr and stops.
+  if (/authentication required/i.test(output)) return "antigravity: authentication required";
+
+  if (!result) return undefined;
+  const status = String(result.status).toUpperCase();
+  if (status === "SUCCESS") return undefined;
+  const error = typeof result.error === "string" ? result.error.trim() : "";
+  const head = error ? error.split("\n", 1)[0] : "";
+  // Antigravity fails loudly on a model it does not know rather than silently
+  // falling back, which is correct but unhelpful without the list to check.
+  const hint = /model/i.test(head) ? " (list them with `agy models`)" : "";
+  return `antigravity: ${status.toLowerCase()}${head ? `: ${head}${hint}` : ""}`;
 };
 
 const mockAdapter: ProviderAdapter = {
@@ -259,21 +317,107 @@ export const apiAdapter = (entry: ApiProviderEntry): ProviderAdapter => ({
   },
 });
 
-const cliAdapters: Record<string, ProviderAdapter> = {
-  mock: mockAdapter,
-  codex: commandAdapter("codex", config.commands.codex, ["exec", "--json", "--sandbox", "workspace-write"]),
-  claude: commandAdapter("claude", config.commands.claude, ["-p", "--permission-mode", "acceptEdits", "--no-session-persistence"]),
-  opencode: commandAdapter("opencode", config.commands.opencode, ["run"]),
+/** How each agent CLI is invoked, shared by running work and by reviewing it. */
+interface CliShape {
+  command: string;
+  args: string[];
+  options?: CommandAdapterOptions;
+}
+
+const cliShapes: Record<string, CliShape> = {
+  codex: { command: config.commands.codex, args: ["exec", "--json", "--sandbox", "workspace-write"] },
+  claude: {
+    command: config.commands.claude,
+    args: ["-p", "--permission-mode", "acceptEdits", "--no-session-persistence"],
+  },
+  opencode: { command: config.commands.opencode, args: ["run"] },
   // `hermes -z PROMPT` binds PROMPT to the -z flag, so the prompt must precede
   // --model or argparse errors with "argument -z/--oneshot: expected one argument".
   // --accept-hooks keeps headless runs from blocking on unseen hooks in config.yaml.
-  hermes: commandAdapter("hermes", config.commands.hermes, ["-z"], {
-    promptFirst: true,
-    extraArgs: ["--accept-hooks"],
-    detectFailure: hermesFailure,
-  }),
-  custom: commandAdapter("custom", config.commands.custom, []),
+  hermes: {
+    command: config.commands.hermes,
+    args: ["-z"],
+    options: { promptFirst: true, extraArgs: ["--accept-hooks"], detectFailure: hermesFailure },
+  },
+  // `agy -p PROMPT` is its headless mode. The prompt is bound to -p, so it has to
+  // come immediately after it, before --model.
+  antigravity: {
+    command: config.commands.antigravity,
+    args: ["-p"],
+    options: {
+      promptFirst: true,
+      extraArgs: config.antigravityArgs,
+      detectFailure: antigravityFailure,
+      looseProbe: true,
+    },
+  },
+  custom: { command: config.commands.custom, args: [] },
 };
+
+const cliAdapters: Record<string, ProviderAdapter> = {
+  mock: mockAdapter,
+  ...Object.fromEntries(
+    Object.entries(cliShapes).map(([id, shape]) => [
+      id,
+      commandAdapter(id as Exclude<ProviderId, "mock">, shape.command, shape.args, shape.options ?? {}),
+    ]),
+  ),
+};
+
+/**
+ * Runs one prompt through an agent CLI and returns what it printed.
+ *
+ * Used to let a CLI act as the reviewer. The prompt is a judgement request, not
+ * work: whatever the CLI would do with tools is left to it, and the reply is read
+ * as text, so a model that starts editing is not silently accepted.
+ */
+export const runCliPrompt = async (
+  id: string,
+  prompt: string,
+  options: { cwd?: string; timeoutMs?: number } = {},
+): Promise<{ stdout: string; exitCode: number }> => {
+  const shape = cliShapes[id];
+  if (!shape || !shape.command) throw new Error(`No command configured for ${id}`);
+  const argv = buildProviderArgs(id as ProviderId, shape.args, prompt, undefined, {
+    ...(shape.options ?? {}),
+    // A review must not inherit the writer's sandbox or auto-approval flags.
+    extraArgs: (shape.options?.extraArgs ?? []).filter(
+      (arg) => !arg.startsWith("--dangerously") && arg !== "--sandbox" && !arg.startsWith("--permission-mode"),
+    ),
+  });
+
+  return new Promise((resolve, reject) => {
+    const child = spawn(shape.command, argv, {
+      cwd: options.cwd,
+      env: { ...process.env, ...secrets.environment() },
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+    let stdout = "";
+    let stderr = "";
+    const timer = setTimeout(() => {
+      child.kill("SIGKILL");
+      reject(new Error(`${id} did not answer within ${options.timeoutMs ?? config.agentTimeoutMs}ms`));
+    }, options.timeoutMs ?? config.agentTimeoutMs);
+    child.stdout.on("data", (chunk: Buffer) => {
+      stdout = `${stdout}${chunk}`.slice(-64_000);
+    });
+    child.stderr.on("data", (chunk: Buffer) => {
+      stderr = `${stderr}${chunk}`.slice(-16_000);
+    });
+    child.once("error", (error) => {
+      clearTimeout(timer);
+      reject(error);
+    });
+    child.once("close", (code) => {
+      clearTimeout(timer);
+      // Some CLIs print the answer on stderr (codex's --json does).
+      resolve({ stdout: `${stdout}\n${stderr}`.trim(), exitCode: code ?? 1 });
+    });
+  });
+};
+
+/** Whether an agent id is one of the agent CLIs that can also review. */
+export const isCliReviewer = (id: string): boolean => Boolean(cliShapes[id]?.command);
 
 const apiAdapterCache = new Map<string, ProviderAdapter>();
 

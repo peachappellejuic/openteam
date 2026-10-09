@@ -11,10 +11,15 @@ import {
   emit,
   followTasks,
   note,
+  agentIsAvailable,
+  fanoutCaveats,
   parseProviderId,
+  queueSummary,
   resolveChange,
   resolveTask,
   say,
+  splitList,
+  submitInstruction,
   titleFromPrompt,
   type Session,
 } from "./core.js";
@@ -38,6 +43,7 @@ import {
 interface Defaults {
   provider?: string;
   model?: string;
+  reviewer?: string;
   assignee?: string;
   paths: string[];
   verify?: string;
@@ -95,6 +101,7 @@ export const startRepl = async (session: Session, args: ParsedArgs): Promise<num
   const defaults: Defaults = {
     provider: flagString(args, "provider"),
     model: flagString(args, "model"),
+    reviewer: flagString(args, "reviewer"),
     assignee: flagString(args, "assignee"),
     paths: splitList(flagString(args, "paths")),
     verify: flagString(args, "verify"),
@@ -142,7 +149,9 @@ export const startRepl = async (session: Session, args: ParsedArgs): Promise<num
 
   const taskOverrides = (parsed: ParsedArgs) => ({
     provider: parseProviderId(flagString(parsed, "provider") ?? defaults.provider),
+    dependencies: [] as string[],
     model: flagString(parsed, "model") ?? defaults.model,
+    reviewer: flagString(parsed, "reviewer") ?? defaults.reviewer,
     assignee: flagString(parsed, "assignee") ?? defaults.assignee,
     allowedPaths: splitList(flagString(parsed, "paths") ?? defaults.paths.join(",")),
     verifyCommand: flagString(parsed, "verify") ?? defaults.verify,
@@ -215,13 +224,23 @@ export const startRepl = async (session: Session, args: ParsedArgs): Promise<num
 
   const runInstruction = async (instruction: string, parsed: ParsedArgs): Promise<void> => {
     const project = await requireProject();
-    const task = await session.orchestrator.createTask(project.id, {
+    const input = {
       ...taskOverrides(parsed),
       title: flagString(parsed, "title") ?? titleFromPrompt(instruction),
       description: instruction,
-    });
-    say(session, dim(`queued ${task.id}`));
-    await follow([task]);
+      // The list form is only valid for a single instruction, so it is resolved
+      // here rather than in taskOverrides, which is shared with plans.
+      provider: flagString(parsed, "provider") ?? defaults.provider,
+      reviewer: flagString(parsed, "reviewer") ?? defaults.reviewer,
+      reviewModel: flagString(parsed, "review-model"),
+      dependencies: splitList(flagString(parsed, "depends")),
+      allowedPaths: splitList(flagString(parsed, "paths") ?? defaults.paths.join(",")),
+      acceptanceTests: [],
+    };
+    const tasks = await submitInstruction(session, project.id, input, agentIsAvailable);
+    say(session, dim(queueSummary(tasks)));
+    for (const warning of fanoutCaveats(tasks, input)) say(session, dim(`  ${warning}`));
+    await follow(tasks);
   };
 
   const runPlan = async (goal: string): Promise<void> => {
@@ -490,9 +509,3 @@ export const startRepl = async (session: Session, args: ParsedArgs): Promise<num
   rl.close();
   return 0;
 };
-
-const splitList = (value: string | undefined): string[] =>
-  (value ?? "")
-    .split(",")
-    .map((item) => item.trim())
-    .filter(Boolean);

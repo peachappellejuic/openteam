@@ -38,7 +38,8 @@ const USAGE = `
     help, version
 
   Agents
-    Installed CLIs       codex, claude, opencode, hermes, custom, mock
+    Installed CLIs       codex, claude, opencode, hermes, antigravity,
+                         custom, mock
     Direct API           openai, anthropic, gemini, openrouter, groq,
                          deepseek, mistral, ollama (local, no key needed)
 
@@ -68,8 +69,13 @@ const USAGE = `
 
   Options
     -p, --project <ref>      project id, name, or path (default: cwd, else the default)
-        --provider <id>      agent to run: mock, codex, claude, opencode, hermes, custom
+        --provider <id>      agent to run: mock, codex, claude, opencode, hermes,
+                         antigravity, custom. Also a comma separated list, or
+                         "all" for every installed agent at once
     -m, --model <model>      model passed through to the agent
+        --reviewer <id>      a different model reviews the diff; on approve it
+                         is merged into the mirror. Publishing stays yours.
+        --review-model <m>   model for the reviewer (defaults to its own)
     -a, --assignee <name>    record who owns the task
         --paths <globs>      comma separated allow list of files to change
         --verify <command>   shell command that must exit 0
