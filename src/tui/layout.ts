@@ -1,6 +1,6 @@
 import { badge, changeBadge, bold, cyan, dim, green, relativeTime, shortSha, yellow } from "../cli/format.js";
 import type { Change, Task } from "../types.js";
-import type { TuiCommand } from "./commands.js";
+import type { PromptOption, TuiCommand } from "./commands.js";
 import { clip, displayWidth, fit, wrap, type Size } from "./screen.js";
 
 export type Pane = "tasks" | "changes";
@@ -138,36 +138,40 @@ export const changeRow = (change: Change, selected: boolean, width: number): str
 export const emptyState = (message: string, width: number): string[] => [`${dim(message)}`].map((line) => fit(line, width));
 
 /**
- * The command palette that opens when the prompt starts with `/`.
+ * The dropdown the prompt raises while it is being completed: a command list for
+ * `/`, a provider list for `--provider`.
  *
- * Height is bounded so a long list cannot take over a short terminal, and the
- * window follows the selection instead of scrolling the page.
+ * Height is bounded so a long list cannot take over a short terminal, the window
+ * follows the selection instead of scrolling the page, and anything hidden is
+ * reported rather than silently dropped.
  */
-export const commandPalette = (
-  commands: TuiCommand[],
+export const optionPalette = (
+  options: PromptOption[],
   selected: number,
   size: Size,
+  title: string,
   maxRows = 10,
 ): string[] => {
-  if (!commands.length) return [fit(dim("no matching command"), size.columns)];
+  if (!options.length) return [fit(dim(`no matching ${title}`), size.columns)];
 
-  const wanted = Math.min(commands.length, Math.max(1, Math.min(maxRows, size.rows - 6)));
-  const start = Math.max(0, Math.min(selected - wanted + 1, commands.length - wanted));
+  const wanted = Math.min(options.length, Math.max(1, Math.min(maxRows, size.rows - 6)));
+  const start = Math.max(0, Math.min(selected - wanted + 1, options.length - wanted));
+  const shown = options.slice(start, start + wanted);
+  const hidden = options.length - wanted;
 
-  const signatureOf = (command: TuiCommand): string =>
-    `/${command.name}${command.usage ? ` ${command.usage}` : ""}`;
-  const nameWidth = Math.max(10, ...commands.map((command) => displayWidth(signatureOf(command))));
+  const lines: string[] = [
+    fit(dim(`${title}  ${options.length}${hidden ? `  (${hidden} not shown)` : ""}`), size.columns),
+  ];
 
-  const hidden = commands.length - wanted;
-  const lines: string[] = [fit(dim(`commands  ${commands.length}${hidden ? `  (${hidden} not shown)` : ""}`), size.columns)];
-
-  for (const [offset, command] of commands.slice(start, start + wanted).entries()) {
+  const nameWidth = Math.max(10, ...options.map((option) => displayWidth(optionLabel(option))));
+  for (const [offset, option] of shown.entries()) {
     const index = start + offset;
     const isSelected = index === selected;
     const marker = isSelected ? cyan("\u203a") : " ";
-    const left = `${marker} ${fit(signatureOf(command), Math.min(nameWidth, size.columns - 8))} `;
+    const label = fit(optionLabel(option), Math.min(nameWidth, size.columns - 8));
+    const left = `${marker} ${option.usable ? label : dim(label)} `;
     const room = Math.max(4, size.columns - displayWidth(left) - 1);
-    const row = fit(`${left}${fit(command.summary, room)}`, size.columns);
+    const row = fit(`${left}${fit(option.summary, room)}`, size.columns);
     lines.push(isSelected ? `\u001b[7m${row}\u001b[27m` : row);
   }
 
@@ -176,6 +180,29 @@ export const commandPalette = (
   }
   return lines;
 };
+
+const optionLabel = (option: PromptOption): string =>
+  option.usage ? `${option.value} ${option.usage}` : option.value;
+
+/** The command palette, which is the option list fed with commands. */
+export const commandPalette = (
+  commands: TuiCommand[],
+  selected: number,
+  size: Size,
+  maxRows = 10,
+): string[] =>
+  optionPalette(
+    commands.map((command) => ({
+      value: `/${command.name}`,
+      usage: command.usage,
+      summary: command.summary,
+      usable: true,
+    })),
+    selected,
+    size,
+    "commands",
+    maxRows,
+  );
 
 /** A single dim line explaining the arguments of the command being typed. */
 export const commandHint = (text: string, width: number): string =>

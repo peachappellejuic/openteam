@@ -333,6 +333,38 @@ It narrows as you type, prefix matches first:
 too short to show the whole list it says how many are hidden rather than dropping them
 silently.
 
+### The provider dropdown
+
+The same thing happens for `--provider` and `--coordinator`. Type the flag and the
+list of agents opens, narrowed to what you have actually got:
+
+```
+› fix the flaky test --provider
+providers  16  (6 not shown)
+› ollama     local, no key needed
+  lmstudio   local, no key needed
+  mock       agent cli
+  claude     agent cli
+  groq       direct api
+  openai     not available    set a key or install it
+  anthropic  not available    set a key or install it
+6 more; keep typing to narrow
+```
+
+Agents you can use right now come first. The rest are listed and marked rather than
+hidden, so you can see that `openai` exists and what it needs. `↑` `↓` choose, `enter`
+or `tab` fills the value in, `esc` clears just that part of the line.
+
+You can keep narrowing after completing — type another letter and the list filters
+again rather than closing:
+
+```
+› fix the flaky test --provider ollama o
+```
+
+Use `--provider` on a one-shot command for the same effect; the dropdown is only there
+so you do not have to remember the ids.
+
 It uses the terminal's alternate screen, so your scrollback survives. If your terminal
 does not handle that well, `openteam repl` gives you the same commands as a plain
 line-based prompt.

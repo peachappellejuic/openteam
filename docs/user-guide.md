@@ -931,7 +931,7 @@ control plane's activity feed carries the per-task event history, and
 ## 13. Development
 
 ```bash
-npm test          # 117 tests
+npm test          # 121 tests
 npm run typecheck # tsc --noEmit, also what `npm run lint` runs
 ```
 

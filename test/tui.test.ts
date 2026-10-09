@@ -2,12 +2,19 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import { clip, displayWidth, fit, isTextKey, promptCursor, wrap } from "../src/tui/screen.js";
-import { commandNames, filterCommands, TUI_COMMANDS } from "../src/tui/commands.js";
+import {
+  commandNames,
+  detectCompletion,
+  filterCommands,
+  filterPromptOptions,
+  TUI_COMMANDS,
+} from "../src/tui/commands.js";
 import {
   changeRow,
   commandHint,
   commandPalette,
   footer,
+  optionPalette,
   header,
   panelTitle,
   sideBySide,
@@ -341,4 +348,78 @@ test("the usage hint survives being wrapped into a narrow footer", () => {
   for (const size of SIZES) {
     assert.ok(displayWidth(commandHint("14 commands  •  enter to complete", size.columns)) <= size.columns);
   }
+});
+
+// --- provider completion ----------------------------------------------------
+
+test("the prompt knows when it is being completed, and what for", () => {
+  assert.deepEqual(detectCompletion("/"), { kind: "command", keep: "", query: "", replaceFrom: 0 });
+  assert.deepEqual(detectCompletion("/ap"), { kind: "command", keep: "", query: "ap", replaceFrom: 0 });
+
+  // A bare provider flag opens the list.
+  const bare = detectCompletion("fix caching --provider");
+  assert.equal(bare?.kind, "provider");
+  assert.equal(bare?.query, "");
+
+  // A partial value filters.
+  assert.equal(detectCompletion("x --provider gro")?.query, "gro");
+  assert.equal(detectCompletion("--coordinator lm")?.query, "lm");
+
+  // Completing then typing more keeps filtering rather than closing.
+  const refined = detectCompletion("fix --provider ollama o");
+  assert.equal(refined?.kind, "provider");
+  assert.equal(refined?.query, "o");
+  assert.equal(refined?.keep, "fix --provider ollama ");
+
+  // A command with an argument, and an unrelated flag, are not completions.
+  assert.equal(detectCompletion("/merge chg_1"), undefined);
+  assert.equal(detectCompletion("task --paths src"), undefined);
+  assert.equal(detectCompletion("no flags at all"), undefined);
+});
+
+test("the kept text always ends in a space so a value cannot run into its flag", () => {
+  for (const input of ["--provider", "fix --provider", "fix --provider gro", "--coordinator", "fix --coordinator g"]) {
+    const request = detectCompletion(input);
+    assert.ok(request?.keep.endsWith(" "), `"${input}" kept "${request?.keep}"`);
+    assert.equal(request?.replaceFrom, input.length - request!.query.length);
+  }
+  // Rebuilding the input from keep + value must be what the user typed.
+  const request = detectCompletion("fix caching --provider")!;
+  assert.equal(`${request.keep}${"ollama"} `, "fix caching --provider ollama ");
+});
+
+test("usable providers are offered before unavailable ones, in a stable order", () => {
+  const options = [
+    { value: "openai", usage: "not available", summary: "set a key or install it", usable: false },
+    { value: "mock", usage: "", summary: "agent cli", usable: true },
+    { value: "claude", usage: "", summary: "agent cli", usable: true },
+    { value: "groq", usage: "", summary: "direct api", usable: true },
+  ];
+  assert.deepEqual(filterPromptOptions(options, "").map((o) => o.value), ["mock", "claude", "groq", "openai"]);
+  // Substring, not prefix: "a" is in both claude and openai.
+  assert.deepEqual(filterPromptOptions(options, "a").map((o) => o.value), ["claude", "openai"]);
+  assert.deepEqual(filterPromptOptions(options, "gr").map((o) => o.value), ["groq"]);
+  assert.deepEqual(filterPromptOptions(options, "zzz"), []);
+  // Order must not depend on the query, or the list jumps around as you type.
+  assert.deepEqual(
+    filterPromptOptions(options, "").map((o) => o.value),
+    filterPromptOptions(options, "").map((o) => o.value),
+  );
+});
+
+test("the provider dropdown renders and fits like the command one", () => {
+  setColor(false);
+  const options = [
+    { value: "ollama", usage: "", summary: "local, no key needed", usable: true },
+    { value: "claude", usage: "", summary: "agent cli", usable: true },
+    { value: "openai", usage: "not available", summary: "set a key or install it", usable: false },
+  ];
+  for (const size of SIZES) {
+    const lines = optionPalette(options, 0, size, "providers");
+    for (const line of lines) {
+      assert.ok(displayWidth(line) <= size.columns, `provider row ${displayWidth(line)} > ${size.columns}`);
+    }
+    assert.match(lines[0], /providers\s+3/);
+  }
+  assert.match(optionPalette([], 0, { columns: 40, rows: 10 }, "providers")[0].trim(), /no matching provider/);
 });

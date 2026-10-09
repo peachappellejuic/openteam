@@ -1,4 +1,3 @@
-import { emitKeypressEvents } from "node:readline";
 
 export interface Size {
   columns: number;
@@ -95,18 +94,28 @@ export class Screen {
   }
 
   public onKey(handler: (key: Key) => void): () => void {
-    emitKeypressEvents(this.input);
-    const listener = (value: string, key: { name?: string; ctrl?: boolean; meta?: boolean; shift?: boolean }): void => {
-      handler({
-        sequence: typeof value === "string" ? value : "",
-        name: key?.name ?? "",
-        ctrl: Boolean(key?.ctrl),
-        meta: Boolean(key?.meta),
-        shift: Boolean(key?.shift),
-      });
+    // Read directly from the stream instead of via emitKeypressEvents: that
+    // decoder emits a bare "escape" for any chunk that ends mid-sequence, so a
+    // fast burst of arrows (one read splitting "\u001b[B\u001b[B") is misread
+    // as Escape and cancels whatever is on screen.
+    let pending = "";
+    const listener = (chunk: Buffer | string): void => {
+      pending += typeof chunk === "string" ? chunk : chunk.toString("utf8");
+      const rest = pending;
+      const keys = decodeKeys(rest);
+      const complete: Key[] = [];
+      for (const key of keys) {
+        if (isIncomplete(key)) {
+          // Keep the partial sequence for the next read.
+          pending = key.sequence;
+          continue;
+        }
+        complete.push(key);
+      }
+      for (const key of complete) handler(key);
     };
-    this.input.on("keypress", listener);
-    return () => this.input.off("keypress", listener);
+    this.input.on("data", listener);
+    return () => this.input.off("data", listener);
   }
 
   public onResize(handler: () => void): () => void {
@@ -170,6 +179,168 @@ const widthOf = (text: string, index: number): { text: string; width: number; le
  */
 export const isTextKey = (key: Key): boolean =>
   !key.ctrl && !key.meta && key.sequence.length === 1 && key.sequence >= " ";
+
+const CSI_FINAL = /[\u0040-\u007e]/;
+
+/** The keys `decodeKeys` produces, plus a marker for a partial sequence. */
+export type DecodedKey = Key | { name: "incomplete"; sequence: string };
+
+/** Narrows the "partial sequence" marker out of a decode. */
+export const isIncomplete = (key: DecodedKey): key is { name: "incomplete"; sequence: string } =>
+  key.name === "incomplete";
+
+/**
+ * Decodes terminal input into keys.
+ *
+ * Returns a trailing key named "incomplete" when the buffer ends part-way
+ * through an escape sequence, so the caller can wait for the rest instead of
+ * acting on a half-read arrow. A lone ESC that is never completed resolves to
+ * "escape" on the following read, or immediately if a timer-driven flush is
+ * wanted; here it is emitted as escape only once more input arrives.
+ */
+export const decodeKeys = (buffer: string): DecodedKey[] => {
+  const keys: DecodedKey[] = [];
+  let index = 0;
+
+  while (index < buffer.length) {
+    const char = buffer[index];
+
+    if (char === "\u001b") {
+      const next = buffer[index + 1];
+      if (next === undefined) {
+        keys.push({ name: "incomplete", sequence: buffer.slice(index) });
+        return keys;
+      }
+      if (next === "[" || next === "O") {
+        // CSI/SS3: parameters, then a final byte in 0x40-0x7e.
+        const params = buffer.slice(index + 2).match(/^[0-9;]*:?[0-9;]*/)?.[0] ?? "";
+        const finalIndex = index + 2 + params.length;
+        const final = buffer[finalIndex];
+        if (final === undefined) {
+          keys.push({ name: "incomplete", sequence: buffer.slice(index) });
+          return keys;
+        }
+        if (!CSI_FINAL.test(final)) {
+          // Not a sequence after all: treat the ESC as its own key.
+          keys.push({ sequence: "\u001b", name: "escape", ctrl: false, meta: false, shift: false });
+          index += 1;
+          continue;
+        }
+        keys.push(decodeCsi(buffer.slice(index, finalIndex + 1), params, final));
+        index = finalIndex + 1;
+        continue;
+      }
+      // ESC followed by a printable character is alt-modified.
+      const code = next.codePointAt(0)!;
+      const text = String.fromCodePoint(code);
+      keys.push({
+        sequence: buffer.slice(index, index + 1 + text.length),
+        name: text,
+        ctrl: false,
+        meta: true,
+        shift: false,
+      });
+      index += 1 + text.length;
+      continue;
+    }
+
+    if (char === "\r") {
+      keys.push({ sequence: char, name: "return", ctrl: false, meta: false, shift: false });
+      index += 1;
+      continue;
+    }
+    if (char === "\n") {
+      keys.push({ sequence: char, name: "enter", ctrl: false, meta: false, shift: false });
+      index += 1;
+      continue;
+    }
+    if (char === "\t") {
+      keys.push({ sequence: char, name: "tab", ctrl: false, meta: false, shift: false });
+      index += 1;
+      continue;
+    }
+    if (char === "\u007f" || char === "\b") {
+      keys.push({ sequence: char, name: "backspace", ctrl: false, meta: false, shift: false });
+      index += 1;
+      continue;
+    }
+    const code = char.codePointAt(0)!;
+    if (code < 0x20) {
+      // Remaining control characters are ctrl-<letter>.
+      keys.push({
+        sequence: char,
+        name: String.fromCharCode(code + 0x60),
+        ctrl: true,
+        meta: false,
+        shift: false,
+      });
+      index += 1;
+      continue;
+    }
+    const text = String.fromCodePoint(code);
+    keys.push({ sequence: text, name: text, ctrl: false, meta: false, shift: false });
+    index += text.length;
+  }
+
+  return keys;
+};
+
+const CSI_NAMES: Record<string, string> = {
+  A: "up",
+  B: "down",
+  C: "right",
+  D: "left",
+  H: "home",
+  F: "end",
+  Z: "tab",
+  P: "f1",
+  Q: "f2",
+  R: "f3",
+  S: "f4",
+};
+
+const CSI_TILDE: Record<string, string> = {
+  "1": "home",
+  "2": "insert",
+  "3": "delete",
+  "4": "end",
+  "5": "pageup",
+  "6": "pagedown",
+  "7": "home",
+  "8": "end",
+  "11": "f1",
+  "12": "f2",
+  "13": "f3",
+  "14": "f4",
+  "15": "f5",
+  "17": "f6",
+  "18": "f7",
+  "19": "f8",
+  "20": "f9",
+  "21": "f10",
+  "23": "f11",
+  "24": "f12",
+};
+
+/**
+ * Decodes one CSI/SS3 sequence.
+ *
+ * The modifier parameter follows `;`: 2 is shift, 3 alt/meta, 5 ctrl, and 6 is
+ * ctrl+shift. Anything unrecognised is left alone rather than guessed at.
+ */
+const decodeCsi = (sequence: string, params: string, final: string): Key => {
+  const parts = params.replace(/:/g, ";").split(";").filter((part) => part !== "");
+  const modifier = Number(parts[1] ?? "1");
+  const ctrl = modifier >= 5 && modifier % 2 === 1;
+  const shift = modifier >= 2 && modifier % 2 === 0;
+  const meta = modifier === 3 || modifier === 7 || modifier === 8;
+
+  if (final === "~") {
+    const name = CSI_TILDE[parts[0] ?? ""] ?? "unknown";
+    return { sequence, name, ctrl, meta, shift };
+  }
+  return { sequence, name: CSI_NAMES[final] ?? "unknown", ctrl, meta, shift };
+};
 
 export const clip = (text: string, width: number): string => {
   if (width <= 0) return "";

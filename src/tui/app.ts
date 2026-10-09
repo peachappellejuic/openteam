@@ -1,10 +1,43 @@
 import { config } from "../config.js";
 import { diffStat, fail, followTasks, resolveChange, resolveTask, say, titleFromPrompt, type Session } from "../cli/core.js";
+import { providerRegistry } from "../providers-registry.js";
+import { isLoopbackUrl } from "../api/registry.js";
+import { knownProviderIds } from "../providers.js";
+import { redact } from "../secrets.js";
+import { apiClientFor } from "../providers.js";
+import {
+  ADD_PROVIDER,
+  FIELD_HELP,
+  applyField,
+  isComplete,
+  draftSummary,
+  emptyDraft,
+  fieldIsSkippable,
+  NO_KEY_WORDS,
+  nextField,
+  providerMenuOptions,
+  suggestEnvName,
+  validateField,
+  wizardActive,
+  wizardTitle,
+  WIRE_CHOICES,
+  type AddField,
+  type ProviderDraft,
+  type ProviderSummary,
+  type WizardStep,
+} from "./wizard.js";
 import { flagBool, flagString, parseArgs, tokenize, UsageError, type ParsedArgs } from "../cli/args.js";
 import { bold, cyan, dim, red } from "../cli/format.js";
 import { PROVIDER_COLUMNS, changeHeader, colorizeDiff, renderProviderRows } from "../cli/render.js";
 import { absolutePath } from "../cli/current.js";
-import { filterCommands, type TuiCommand } from "./commands.js";
+import {
+  detectCompletion,
+  exactCommand,
+  filterCommands,
+  filterPromptOptions,
+  type CompletionRequest,
+  type PromptOption,
+} from "./commands.js";
 import { connectRepository, selectProject } from "../cli/project.js";
 import { table } from "../cli/format.js";
 
@@ -13,8 +46,8 @@ import { clip, fit, isTextKey, Screen, wrap, type Key, type Size } from "./scree
 import {
   changeRow,
   commandHint,
-  commandPalette,
   emptyState,
+  optionPalette,
   footer,
   header,
   panelTitle,
@@ -44,10 +77,12 @@ interface State {
   messageKind: "info" | "error";
   /** Tasks being followed, so a second run cannot start on top of one. */
   following: string[];
-  /** Index into the command palette while the prompt starts with `/`. */
-  paletteIndex: number;
-  paletteOpen: () => boolean;
-  paletteMatches: () => TuiCommand[];
+  /** Index into whichever dropdown the prompt is completing. */
+  completionIndex: number;
+  completion: () => CompletionRequest | undefined;
+  options: () => PromptOption[];
+  /** Set while a multi-step flow owns the keyboard, such as `/provider`. */
+  wizard?: WizardStep;
 }
 
 const PANE_TASKS: Pane = "tasks";
@@ -88,9 +123,9 @@ export const runTui = async (session: Session, args: ParsedArgs): Promise<number
     message: "",
     messageKind: "info",
     following: [],
-    paletteIndex: 0,
-    paletteOpen: () => false,
-    paletteMatches: () => [],
+    completionIndex: 0,
+    completion: () => undefined,
+    options: () => [],
   };
 
   const provider = flagString(args, "provider");
@@ -132,27 +167,184 @@ export const runTui = async (session: Session, args: ParsedArgs): Promise<number
     });
   };
 
-  const paletteHintText = (matches: TuiCommand[]): string =>
-    matches.length
-      ? `${matches.length} command${matches.length === 1 ? "" : "s"}  \u2022  \u2191\u2193 choose  \u2022  enter or tab to complete  \u2022  esc to dismiss`
-      : "no matching command  \u2022  esc to dismiss";
-
-  /** True while the prompt is still a bare command name, before any argument. */
-  const paletteQuery = (): string | undefined => {
-    if (state.detail || !state.input.startsWith("/")) return undefined;
-    if (state.input.slice(1).includes(" ")) return undefined;
-    return state.input;
+  const completionHint = (request: CompletionRequest | undefined, matches: PromptOption[]): string => {
+    if (!request) return "";
+    const noun = request.kind === "command" ? "command" : "provider";
+    if (!matches.length) return `no matching ${noun}  \u2022  esc to dismiss`;
+    const plural = matches.length === 1 ? "" : "s";
+    return `${matches.length} ${noun}${plural}  \u2022  \u2191\u2193 choose  \u2022  enter or tab to complete  \u2022  esc to dismiss`;
   };
 
-  const paletteMatches = (): TuiCommand[] => {
-    const query = paletteQuery();
-    return query === undefined ? [] : filterCommands(query);
+  // Availability probes spawn `--version` per agent CLI, so the result is cached
+  // rather than recomputed on every keystroke.
+  let providerCache: { at: number; options: PromptOption[] } | undefined;
+  const PROVIDER_CACHE_MS = 5_000;
+
+  const describeProvider = (id: string): string => {
+    const entry = providerRegistry().get(id);
+    if (!entry) return "agent cli";
+    return entry.requiresKey ? "direct api" : "local, no key needed";
   };
 
-  state.paletteOpen = (): boolean => paletteQuery() !== undefined;
-  state.paletteMatches = (): TuiCommand[] => {
-    const query = paletteQuery();
-    return query === undefined ? [] : filterCommands(query);
+  const refreshProviders = async (force = false): Promise<void> => {
+    if (!force && providerCache && Date.now() - providerCache.at < PROVIDER_CACHE_MS) return;
+    const listed = await session.orchestrator.getProviders();
+    providerCache = {
+      at: Date.now(),
+      options: listed.map((provider) => ({
+        value: provider.id,
+        usage: provider.available ? "" : "not available",
+        summary: provider.available ? describeProvider(provider.id) : "set a key or install it",
+        usable: provider.available,
+      })),
+    };
+    dirty = true;
+  };
+
+  // --- provider wizard ------------------------------------------------------
+
+  const providerSummaries = (): ProviderSummary[] => {
+    const registry = providerRegistry();
+    return knownProviderIds().map((id) => {
+      const entry = registry.get(id);
+      const needsKey = Boolean(entry?.requiresKey);
+      const hasKey = needsKey && session.secrets.getAny(entry?.envNames ?? []) !== undefined;
+      return {
+        id,
+        needsKey,
+        authenticated: hasKey,
+        usable: hasKey || !needsKey,
+        kind: entry ? (entry.requiresKey ? "direct api" : "local") : "agent cli",
+        label: entry?.label ?? id,
+      };
+    });
+  };
+
+  const menuOptions = (): PromptOption[] => providerMenuOptions(providerSummaries());
+
+  const wireHelp = (wire: string): string =>
+    wire === "openai"
+      ? "OpenAI-compatible chat completions"
+      : wire === "anthropic"
+        ? "Anthropic messages api"
+        : "Google generateContent";
+
+  const openWizard = (step: WizardStep): void => {
+    state.wizard = step;
+    state.input = "";
+    state.completionIndex = 0;
+    dirty = true;
+  };
+
+  /** Leaves the wizard, keeping whatever message it produced. */
+  const closeWizard = (message: string, kind: "info" | "error"): void => {
+    state.wizard = undefined;
+    state.input = "";
+    note(message, kind);
+  };
+
+  const saveCredential = async (envName: string, label: string, value: string): Promise<void> => {
+    try {
+      session.secrets.set(envName, value);
+    } catch (error) {
+      closeWizard(error instanceof Error ? error.message : "could not store that key", "error");
+      return;
+    }
+
+    const entry = providerSummaries().find((candidate) => {
+      const registryEntry = providerRegistry().get(candidate.id);
+      return registryEntry?.envNames.includes(envName);
+    });
+    let detail = `${label}: stored ${redact(value)}`;
+    let kind: "info" | "error" = "info";
+
+    if (entry) {
+      const registryEntry = providerRegistry().get(entry.id);
+      if (registryEntry) {
+        try {
+          await apiClientFor(registryEntry).ping();
+          detail += " — accepted by the provider";
+        } catch (error) {
+          detail += ` — ${error instanceof Error ? error.message : "the provider did not accept it"}`;
+          kind = "error";
+        }
+      }
+    } else {
+      detail += " (not attached to a provider yet)";
+    }
+
+    openWizard({ kind: "providerMenu" });
+    note(detail, kind);
+  };
+
+  const addProviderFromDraft = async (draft: ProviderDraft, key: string): Promise<void> => {
+    let saved;
+    try {
+      saved = providerRegistry().add({
+        id: draft.id,
+        label: draft.id,
+        wire: draft.wire,
+        baseUrl: draft.baseUrl,
+        envName: draft.requiresKey ? draft.envName : undefined,
+        defaultModel: draft.defaultModel,
+        requiresKey: draft.requiresKey,
+      });
+    } catch (error) {
+      closeWizard(error instanceof Error ? error.message : "could not add that provider", "error");
+      return;
+    }
+
+    await refreshProviders(true);
+    if (!draft.requiresKey || !key.trim()) {
+      openWizard({ kind: "providerMenu" });
+      note(`added ${bold(saved.id)} — no key needed`, "info");
+      return;
+    }
+    try {
+      session.secrets.set(draft.envName!, key.trim());
+    } catch (error) {
+      openWizard({ kind: "providerMenu" });
+      note(`added ${saved.id}, but ${error instanceof Error ? error.message : "the key was not stored"}`, "error");
+      return;
+    }
+    openWizard({ kind: "providerMenu" });
+    note(`added ${bold(saved.id)} — key stored, run \`openteam keys test ${saved.id}\` to confirm`, "info");
+  };
+
+  /** Advances the add-provider form after a field validates. */
+  const advanceAdd = (draft: ProviderDraft, field: AddField, value: string): void => {
+    let next = applyField(draft, field, value);
+    if (field === "id") next = { ...next, envName: next.envName ?? suggestEnvName(value) };
+
+    if (field === "id" && isLoopbackUrl(value)) next = { ...next, requiresKey: false };
+
+    const following = nextField(next, field);
+    if (following === "wire") {
+      openWizard({ kind: "addWire", draft: next, selected: 0 });
+      return;
+    }
+    if (!following) {
+      openWizard({ kind: "addKey", draft: next, value: "", message: "" });
+      return;
+    }
+    openWizard({ kind: "addText", field: following, draft: next, value: "", message: "" });
+  };
+
+  state.completion = (): CompletionRequest | undefined =>
+    state.detail || wizardActive(state.wizard) ? undefined : detectCompletion(state.input);
+
+  state.options = (): PromptOption[] => {
+    const request = state.completion();
+    if (!request) return [];
+    if (request.kind === "command") {
+      return filterCommands(request.query).map((command) => ({
+        value: `/${command.name}`,
+        usage: command.usage,
+        summary: command.summary,
+        usable: true,
+      }));
+    }
+    return filterPromptOptions(providerCache?.options ?? [], request.query);
   };
 
   const note = (message: string, kind: State["messageKind"] = "info"): void => {
@@ -225,12 +417,46 @@ export const runTui = async (session: Session, args: ParsedArgs): Promise<number
 
     // The palette has to be reserved from the body, not appended after it:
     // the body is otherwise sized to fill the screen and leaves no room.
-    const paletteLines = state.paletteOpen()
-      ? commandPalette(state.paletteMatches(), state.paletteIndex, size)
-      : [];
-    const paletteHint = state.paletteOpen()
-      ? [commandHint(paletteHintText(state.paletteMatches()), size.columns)]
-      : [];
+    const step = state.wizard;
+    const request = state.completion();
+    const matches = request ? state.options() : [];
+    const dropdownTitle = request?.kind === "provider" ? "providers" : "commands";
+
+    // A wizard step and the prompt dropdown both claim the rows above the
+    // prompt, so exactly one of them is ever drawn.
+    let dropdownLines: string[] = [];
+    let paletteHint: string[] = [];
+    let footerHint = state.busy ? HINTS.busy : state.detail ? HINTS.detail : HINTS.idle;
+
+    if (step) {
+      const inner = Math.max(30, size.columns - 8);
+      if (step.kind === "providerMenu") {
+        const options = menuOptions();
+        dropdownLines = optionPalette(options, state.completionIndex, size, "providers");
+        paletteHint = [commandHint(`${options.length} entries  \u2022  \u2191\u2193 choose  \u2022  enter to configure  \u2022  esc to leave`, size.columns)];
+        footerHint = "providers";
+      } else if (step.kind === "addWire") {
+        const options = WIRE_CHOICES.map((wire) => ({ value: wire, usage: "", summary: wireHelp(wire), usable: true }));
+        dropdownLines = optionPalette(options, step.selected, size, "wire format");
+        paletteHint = [commandHint("\u2191\u2193 choose  \u2022  enter to confirm  \u2022  esc to cancel", size.columns)];
+        footerHint = `${step.draft.id ?? "new provider"} — wire format`;
+      } else if (step.kind === "addText") {
+        paletteHint = [commandHint(`${FIELD_HELP[step.field]}  \u2022  enter to continue  \u2022  esc to cancel`, size.columns)];
+        footerHint = wizardTitle(step);
+      } else if (step.kind === "credential") {
+        paletteHint = [
+          ...(step.message ? [commandHint(step.message, size.columns)] : []),
+          commandHint("the value is not echoed  \u2022  enter saves and tests it  \u2022  esc to cancel", size.columns),
+        ];
+        footerHint = `${wizardTitle(step)} \u2014 ${step.envName}`;
+      } else {
+        paletteHint = [commandHint("the value is not echoed  \u2022  enter saves it  \u2022  esc to finish without a key", size.columns)];
+        footerHint = wizardTitle(step);
+      }
+    } else if (request) {
+      dropdownLines = optionPalette(matches, state.completionIndex, size, dropdownTitle);
+      paletteHint = [commandHint(completionHint(request, matches), size.columns)];
+    }
 
     const { left: listWidth, right: detailWidth } = splitWidths(size);
     const listLines: string[] = [panelTitle(state.pane === PANE_TASKS ? "tasks" : "changes", listWidth, items.length)];
@@ -239,7 +465,7 @@ export const runTui = async (session: Session, args: ParsedArgs): Promise<number
     const messageRows = state.message ? 1 : 0;
     const bodyHeight = Math.max(
       1,
-      size.rows - top.length - footerRows - messageRows - paletteLines.length - paletteHint.length,
+      size.rows - top.length - footerRows - messageRows - dropdownLines.length - paletteHint.length,
     );
 
     if (!items.length) {
@@ -293,12 +519,15 @@ export const runTui = async (session: Session, args: ParsedArgs): Promise<number
       frames.push(fit(state.messageKind === "error" ? red(state.message) : dim(state.message), size.columns));
     }
 
-    frames.push(...paletteLines, ...paletteHint);
+    frames.push(...dropdownLines, ...paletteHint);
     frames.push(
       ...footer(
         size,
-        state.input,
-        state.busy ? HINTS.busy : state.detail ? HINTS.detail : HINTS.idle,
+        // Credentials are never drawn; the length is enough to show progress.
+        state.wizard?.kind === "credential" || state.wizard?.kind === "addKey"
+          ? "*".repeat(Math.min(state.input.length, 12))
+          : state.input,
+        footerHint,
         state.busy,
       ),
     );
@@ -344,16 +573,18 @@ export const runTui = async (session: Session, args: ParsedArgs): Promise<number
     }
   };
 
-  /** Fills the prompt with the highlighted command, leaving room for arguments. */
+  /** Inserts the highlighted choice, leaving room for any further argument. */
   const completeFromPalette = (): void => {
-    const matches = state.paletteMatches();
-    const chosen = matches[state.paletteIndex] ?? matches[0];
+    const request = state.completion();
+    if (!request) return;
+    const matches = state.options();
+    const chosen = matches[state.completionIndex] ?? matches[0];
     if (!chosen) {
-      state.input = "";
+      state.input = request.keep;
       return;
     }
-    state.input = `/${chosen.name} `;
-    state.paletteIndex = 0;
+    state.input = `${request.keep}${chosen.value} `;
+    state.completionIndex = 0;
   };
 
   const submit = async (): Promise<void> => {
@@ -477,6 +708,11 @@ export const runTui = async (session: Session, args: ParsedArgs): Promise<number
           note(table(PROVIDER_COLUMNS, renderProviderRows(await session.orchestrator.getProviders())), "info");
           state.detail = true;
           break;
+
+        case "provider":
+          await refreshProviders(true);
+          openWizard({ kind: "providerMenu" });
+          return;
         case "keys": {
           const { keyRows } = await import("../cli/render.js");
           const { KEY_COLUMNS, renderKeyRows } = await import("../cli/render.js");
@@ -525,7 +761,124 @@ export const runTui = async (session: Session, args: ParsedArgs): Promise<number
     handleKey(key);
   });
 
+  const handleWizardKey = (key: Key): boolean => {
+    const step = state.wizard;
+    if (!step) return false;
+
+    if (key.name === "escape") {
+      closeWizard("cancelled", "info");
+      return true;
+    }
+    if (key.ctrl && key.name === "u") {
+      state.input = "";
+      dirty = true;
+      return true;
+    }
+    if (key.name === "backspace") {
+      state.input = state.input.slice(0, -1);
+      dirty = true;
+      return true;
+    }
+
+    if (step.kind === "providerMenu" || step.kind === "addWire") {
+      const options = step.kind === "providerMenu"
+        ? menuOptions()
+        : WIRE_CHOICES.map((wire) => ({ value: wire, usage: "", summary: wireHelp(wire), usable: true }));
+      const count = step.kind === "providerMenu" ? options.length : WIRE_CHOICES.length;
+
+      if (key.name === "up") {
+        state.completionIndex = Math.max(0, state.completionIndex - 1);
+        dirty = true;
+        return true;
+      }
+      if (key.name === "down") {
+        state.completionIndex = Math.min(count - 1, state.completionIndex + 1);
+        dirty = true;
+        return true;
+      }
+      if (key.name === "return" || key.name === "enter" || key.name === "tab") {
+        if (step.kind === "providerMenu") {
+          const chosen = options[state.completionIndex] ?? options[0];
+          if (!chosen) return true;
+          if (chosen.value === ADD_PROVIDER) {
+            openWizard({ kind: "addText", field: "id", draft: emptyDraft(), value: "", message: "" });
+            return true;
+          }
+          const summary = providerSummaries().find((candidate) => candidate.id === chosen.value);
+          const entry = providerRegistry().get(chosen.value);
+          if (!summary || !entry) {
+            // An agent CLI, not a direct API provider: nothing to authenticate.
+            note(`${chosen.value} authenticates through its own CLI, not a key here`, "info");
+            return true;
+          }
+          if (!summary.needsKey) {
+            note(`${entry.label} needs no key`, "info");
+            return true;
+          }
+          openWizard({
+            kind: "credential",
+            envName: entry.envNames[0],
+            label: entry.label,
+            value: "",
+            message: summary.authenticated ? "replacing the stored key" : "",
+          });
+          return true;
+        }
+        const wire = WIRE_CHOICES[state.completionIndex] ?? "openai";
+        const following = nextField({ ...step.draft, wire }, "wire");
+        openWizard({ kind: "addText", field: following ?? "envName", draft: { ...step.draft, wire }, value: "", message: "" });
+        return true;
+      }
+      return true;
+    }
+
+    if (key.name === "return" || key.name === "enter") {
+      if (step.kind === "credential") {
+        const value = state.input.trim();
+        if (!value) {
+          state.input = "";
+          note("nothing entered; the key is unchanged", "error");
+          return true;
+        }
+        launch(() => saveCredential(step.envName, step.label, value));
+        return true;
+      }
+      if (step.kind === "addKey") {
+        launch(() => addProviderFromDraft(step.draft, state.input));
+        return true;
+      }
+      if (step.kind === "addText") {
+        const value = step.field === "envName" && NO_KEY_WORDS.includes(state.input.trim().toLowerCase())
+          ? ""
+          : state.input.trim();
+        const draft = value === "" && fieldIsSkippable(step.draft, step.field)
+          ? { ...step.draft, requiresKey: false, envName: undefined }
+          : step.draft;
+        const check = validateField(step.field, value, {
+          draft,
+          existingIds: knownProviderIds(),
+        });
+        if (!check.ok) {
+          note(check.message, "error");
+          dirty = true;
+          return true;
+        }
+        advanceAdd(draft, step.field, check.message);
+        dirty = true;
+        return true;
+      }
+    }
+
+    if (isTextKey(key)) {
+      state.input += key.sequence;
+      dirty = true;
+      return true;
+    }
+    return true;
+  };
+
   const handleKey = (key: Key): void => {
+    if (handleWizardKey(key)) return;
     // Control keys work even while busy; text entry does not, so a keystroke
     // typed during a run cannot become part of the next instruction.
     if (key.ctrl && key.name === "c") {
@@ -538,8 +891,8 @@ export const runTui = async (session: Session, args: ParsedArgs): Promise<number
       return;
     }
     if (key.name === "up") {
-      if (state.paletteOpen()) {
-        state.paletteIndex = Math.max(0, state.paletteIndex - 1);
+      if (state.completion() !== undefined) {
+        state.completionIndex = Math.max(0, state.completionIndex - 1);
         dirty = true;
         return;
       }
@@ -549,8 +902,8 @@ export const runTui = async (session: Session, args: ParsedArgs): Promise<number
       return;
     }
     if (key.name === "down") {
-      if (state.paletteOpen()) {
-        state.paletteIndex = Math.min(state.paletteMatches().length - 1, state.paletteIndex + 1);
+      if (state.completion() !== undefined) {
+        state.completionIndex = Math.min(state.options().length - 1, state.completionIndex + 1);
         dirty = true;
         return;
       }
@@ -560,7 +913,7 @@ export const runTui = async (session: Session, args: ParsedArgs): Promise<number
       return;
     }
     if (key.name === "tab") {
-      if (state.paletteOpen()) {
+      if (state.completion() !== undefined) {
         completeFromPalette();
         dirty = true;
         return;
@@ -572,7 +925,7 @@ export const runTui = async (session: Session, args: ParsedArgs): Promise<number
       return;
     }
     if (key.name === "escape") {
-      if (state.paletteOpen()) {
+      if (state.completion() !== undefined) {
         // Dismiss without losing the rest of what was typed.
         state.input = "";
         dirty = true;
@@ -585,14 +938,26 @@ export const runTui = async (session: Session, args: ParsedArgs): Promise<number
     }
     if (key.name === "return" || key.name === "enter") {
       // Enter completes a palette choice rather than running it, so a
-      // half-typed command never fires with the wrong argument.
-      if (state.paletteOpen() && state.paletteMatches().length) {
-        completeFromPalette();
-        dirty = true;
-        return;
+      // half-typed command never fires with the wrong argument. The one
+      // exception: the highlighted row already is the name that was typed, so
+      // completing would only add a space and demand a second Enter. Arrowing
+      // to a longer name still completes normally.
+      const named = exactCommand(state.input);
+      if (state.completion() !== undefined && state.options().length) {
+        // Option values keep the leading slash; exactCommand does not.
+        const highlighted = state.options()[state.completionIndex]?.value.replace(/^\//, "");
+        if (!named || highlighted !== named) {
+          completeFromPalette();
+          dirty = true;
+          return;
+        }
       }
       if (state.detail && state.selected >= 0) {
         launch(runSelected);
+        return;
+      }
+      if (named) {
+        launch(slash.bind(null, `/${named}`));
         return;
       }
       launch(submit);
@@ -602,7 +967,7 @@ export const runTui = async (session: Session, args: ParsedArgs): Promise<number
 
     if (key.name === "backspace") {
       state.input = state.input.slice(0, -1);
-      state.paletteIndex = 0;
+      state.completionIndex = 0;
       dirty = true;
       return;
     }
@@ -626,7 +991,10 @@ export const runTui = async (session: Session, args: ParsedArgs): Promise<number
     // approve a change instead of typing. Arrows navigate; `/` gives commands.
     if (isTextKey(key)) {
       state.input += key.sequence;
-      state.paletteIndex = 0;
+      state.completionIndex = 0;
+      if (detectCompletion(state.input)?.kind === "provider") {
+        void refreshProviders().catch(() => undefined);
+      }
       dirty = true;
     }
   };
@@ -640,6 +1008,9 @@ export const runTui = async (session: Session, args: ParsedArgs): Promise<number
     }
   }, 60);
   draw();
+
+  // Warm the provider list in the background so opening the dropdown is instant.
+  void refreshProviders().catch(() => undefined);
 
   await new Promise<void>((resolvePromise) => {
     const poll = setInterval(() => {
